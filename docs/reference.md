@@ -68,6 +68,7 @@ is 121, and never 1.
 | 98 | **A signal ended the job** — one that qex did not send, and that was not TERM or KILL. Read the number in the record before you act: a fault inside the job, such as SIGSEGV, means the work must change; a signal from outside, such as `kill -INT`, means the same command can run again. A kill, a cancel or a time limit gives 125, and an **external** `kill -9` gives 125 as well: qex cannot know who sent it. |
 | 99 | **The kernel stopped the job for memory.** qex REPORTS this and acts on it in no way: no new attempt, no changed claim. qex reads a kill count that covers every program of your user, so it cannot say your job was the victim and cannot say the claim was too small — the machine can be full while your claim is correct. Compare the `usage` field with the claim. macOS keeps no such count and gives 125 for the same kill, so never wait for 99 there. |
 | 100 | The job has not stopped, so there is no result. Only `qex status --quiet` with no wait gives it. |
+| 101 | **The disk is full, and the job did not run.** The job waited for disk space that programs outside the queue hold (`--disk-wait-limit`, 60 seconds by default), so qex cancelled it. stderr says what to free. Free the space and submit the job again. |
 | 121 | qex could not do what you asked. No job ran. |
 | 122 | Your wait stopped, and the job did not. Attach to it again. |
 | 123 | The job gave up in the queue. It reached its `--max-queue-time`. |
@@ -156,6 +157,7 @@ lines of both streams.
 | `--follow` | Wait here, and write the output of the job as it arrives. This is `qex run` in a longer form. |
 | `--quiet` | With `--wait`, write no record and no queue reason. Give the exit code of the job. qex still reports a fault of the wait, because those lines give the id. |
 | `--wait-timeout TIME` | Stop **your wait** after this time. The job continues, and the code is 124. `--timeout` stops the **job** instead. |
+| `--disk-wait-limit TIME` | With `--wait` or `qex run`: how long a job may wait for disk space that programs outside the queue hold before qex cancels it and exits with **101**. Default `60s`; `0` or `none` waits for ever. There is no config key. |
 | `--id-file FILE` | Write the id to this file. qex writes the file, sends the data to the disk and closes it **before** the wait begins. |
 
 **Why one command and not two.** `qex submit` and then `qex wait` is two
@@ -413,6 +415,16 @@ the jobs that operate with the free space of each filesystem, less
 `[system] reserve_disk`, and `[system] min_free_disk` can stop all work on a
 filesystem that is nearly full. [Disk claims](disk.md) states every rule, and
 the things that qex does not do.
+
+**A wait for a disk that outside programs hold ends in an error.** When a job of
+`qex submit --wait` or `qex run` has waited for disk space in the class
+`waits-for-machine` for 60 seconds without a break (the floor `min_free_disk`, or
+a claim and reserve that outside programs prevent), qex cancels the job, writes
+the filesystem, the free space and how much to free on stderr, and exits with
+**101**. `--disk-wait-limit TIME` sets the grace for one call, and `none` waits for
+ever. There is no config key, because qex 0.33.0 refuses a key that it does not
+know. A wait for the jobs of the queue itself never ends this way, and `qex wait`
+and `qex status --wait` never give up. See D13 in [Disk claims](disk.md).
 
 ### qex learns the size of a task
 

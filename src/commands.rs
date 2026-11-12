@@ -78,6 +78,13 @@ pub const EXIT_EXPIRED: i32 = 123;
 pub const EXIT_TIMEOUT: i32 = 124;
 /// The exit code of `qex wait` when something stopped the job.
 pub const EXIT_KILLED: i32 = 125;
+/// The exit code when a job waited for disk space that no job of the queue
+/// would free, and the grace (D13 of `docs/disk.md`) passed.
+///
+/// The correction is on the disk. This code is not 123: the job did not reach
+/// its own `--max-queue-time`. It is not 124: the reader set no time limit on
+/// the wait for the job. It is not 125: nothing stopped a job that ran.
+pub const EXIT_DISK_FULL: i32 = 101;
 /// The exit code of `qex wait` when the job did not run.
 ///
 /// A job that this job needed did not succeed. The fault is in that job, and
@@ -116,6 +123,16 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             "`--quiet` needs `--wait`. It says that qex writes no record when the job \
              stops.\n\n\
              \x20   qex submit --wait --quiet -- COMMAND"
+        );
+    }
+
+    // The limit is the grace of a WAIT (D13). A submission that waits for
+    // nothing has no use for it, and qex does not accept an option in silence.
+    if args.disk_wait_limit.is_some() && !args.wait && !args.follow {
+        bail!(
+            "`--disk-wait-limit` needs `--wait`. It sets how long the wait lasts for a disk that \
+             programs outside the queue hold.\n\n\
+             \x20   qex submit --wait --disk-wait-limit 60s -- COMMAND"
         );
     }
 
@@ -185,6 +202,13 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
 
     let mut client = Client::connect()?;
     warn_if_version_differs(&mut client);
+    // Read the limit BEFORE the job exists: a limit that qex cannot read, or that
+    // the coordinator cannot obey, is an error and not a job in the queue.
+    let disk_limit = if args.wait {
+        disk_wait_limit(&mut client, args.disk_wait_limit.as_deref())?
+    } else {
+        None
+    };
 
     // Change each dependency name into an id.
     //
@@ -229,6 +253,12 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
                     args.wait_timeout.as_deref(),
                     args.json,
                     args.quiet,
+                    disk_limit.map(|limit| DiskGrace {
+                        limit,
+                        // A dedupe key can give this command a job that another
+                        // command made, and this command cancels no such job.
+                        started_here: !deduplicated,
+                    }),
                 );
             }
             if args.json {
@@ -306,6 +336,97 @@ fn report_the_record(id: &str, json: bool) {
     }
 }
 
+/// What a command that submitted a job and waits for it needs for the grace of
+/// D13: how long to wait, and whether this command made the job.
+struct DiskGrace {
+    /// `None` waits for ever.
+    limit: Option<Duration>,
+    /// False when a dedupe key gave this command a job that another command
+    /// made. This command stops its wait, and it cancels nothing.
+    started_here: bool,
+}
+
+/// Reads `--disk-wait-limit` and asks the coordinator if it can write the cause
+/// of a disk wait into the record (D13). Gives `None` when it cannot: the job
+/// then waits as before. An explicit limit against such a coordinator is an
+/// error, as `--disk` is.
+fn disk_wait_limit(client: &mut Client, given: Option<&str>) -> Result<Option<Option<Duration>>> {
+    let limit = crate::disk::parse_wait_limit(given).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (have, version, pid) = coordinator_capabilities(client)?;
+    if have.iter().any(|c| c == "disk-wait") {
+        return Ok(Some(limit));
+    }
+    if given.is_some() {
+        crate::capabilities::check_disk_wait(&have, &version, pid)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(None)
+}
+
+/// The answer of [`give_up_on_disk`].
+enum GaveUp {
+    /// The command is done, with this exit code.
+    Stopped(i32),
+    /// The job started while the command gave up. The wait goes on as usual.
+    JobMoved,
+}
+
+/// Ends the wait for a job that waits for disk space that no job of this queue
+/// holds (D13): cancel the job when this command made it, say what to free, and
+/// choose the exit code.
+fn give_up_on_disk(
+    client: Option<&mut Client>,
+    id: uuid::Uuid,
+    shortage: &crate::disk::DiskShortage,
+    grace: &DiskGrace,
+) -> GaveUp {
+    let mut cancelled = false;
+    if !grace.started_here {
+        eprintln!(
+            "qex: a dedupe key gave this command the job {id}. Another command made it, so \
+             this command does not cancel it."
+        );
+    } else {
+        let answer = match client {
+            Some(client) => client.call(&Request::Cancel { id }),
+            None => Err(anyhow::anyhow!("the coordinator does not answer")),
+        };
+        match answer {
+            Ok(Response::Ok) => cancelled = true,
+            // The job started in the moment before the cancel. It is a job that
+            // runs now, and the wait for it is the ordinary wait.
+            Ok(Response::Error {
+                kind: ErrorKind::WrongState,
+                ..
+            }) => return GaveUp::JobMoved,
+            Ok(other) => eprintln!("qex: qex could not cancel the job {id}: {other:?}"),
+            Err(e) => eprintln!("qex: qex could not cancel the job {id}: {e:#}"),
+        }
+    }
+    let advice = crate::disk::Advice {
+        shortage,
+        free_now: crate::sys::filesystem(&shortage.path).map(|f| f.free),
+        id,
+        limit: grace.limit,
+        nix: on_path("nix-store"),
+        cancelled,
+    };
+    eprint!("{}", crate::disk::advice_text(&advice));
+    GaveUp::Stopped(EXIT_DISK_FULL)
+}
+
+/// True when a program of this name is on the PATH.
+fn on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(name))
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+    })
+}
+
 /// Waits for the job that `qex submit --wait` started.
 ///
 /// # Why this option exists
@@ -321,7 +442,13 @@ fn report_the_record(id: &str, json: bool) {
 ///
 /// One command also closes a race. Between a submission and a wait a short job
 /// can stop, and a `qex clean` in that window deletes the record.
-fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: bool) -> Result<i32> {
+fn wait_after_submit(
+    raw_id: &str,
+    timeout: Option<&str>,
+    json: bool,
+    quiet: bool,
+    mut grace: Option<DiskGrace>,
+) -> Result<i32> {
     let deadline = match timeout {
         Some(t) => parse_duration(t)
             .map_err(|e| anyhow::anyhow!("--wait-timeout: {e}"))?
@@ -337,41 +464,59 @@ fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: boo
     };
 
     catch_signals_while_waiting();
-    // `--quiet` silences the REPORT and the narration of the queue. It does not
-    // silence a fault of the wait: those lines name the fault and give the id
-    // that attaches to the job again, and a caller that loses them holds
-    // nothing. See `qex help exit-codes`.
-    let mut reporter = ReasonReporter::new(json || quiet);
     let ids = [raw_id.to_string()];
 
-    match wait_one(raw_id, deadline, &mut reporter)? {
-        WaitOutcome::Finished(status) => {
-            let code = exit_code_for(&status);
-            if !quiet {
-                // A job that stopped a moment before the limit leaves no time
-                // for the record.
-                crate::client::give_the_record_its_own_time();
-                report_the_record(raw_id, json);
+    loop {
+        // `--quiet` silences the REPORT and the narration of the queue. It does
+        // not silence a fault of the wait: those lines name the fault and give
+        // the id that attaches to the job again, and a caller that loses them
+        // holds nothing. See `qex help exit-codes`.
+        let mut reporter = ReasonReporter::new(json || quiet);
+        if let Some(g) = &grace {
+            reporter = reporter.with_disk_grace(g.limit);
+        }
+
+        match wait_one(raw_id, deadline, &mut reporter)? {
+            WaitOutcome::Finished(status) => {
+                let code = exit_code_for(&status);
+                if !quiet {
+                    // A job that stopped a moment before the limit leaves no
+                    // time for the record.
+                    crate::client::give_the_record_its_own_time();
+                    report_the_record(raw_id, json);
+                }
+                return Ok(code);
             }
-            Ok(code)
-        }
-        // A FAULT of the wait always reaches stderr. stdout keeps its JSON,
-        // and `--quiet` keeps the record away; neither hides the line that
-        // carries the id.
-        WaitOutcome::TimedOut => {
-            say_that_the_wait_reached_its_limit(&ids, timeout);
-            // The reader asked for the record, and the record exists. See
-            // `say_that_the_wait_reached_its_limit`.
-            if !quiet {
-                report_the_record(raw_id, json);
+            // A FAULT of the wait always reaches stderr. stdout keeps its JSON,
+            // and `--quiet` keeps the record away; neither hides the line that
+            // carries the id.
+            WaitOutcome::TimedOut => {
+                say_that_the_wait_reached_its_limit(&ids, timeout);
+                // The reader asked for the record, and the record exists. See
+                // `say_that_the_wait_reached_its_limit`.
+                if !quiet {
+                    report_the_record(raw_id, json);
+                }
+                return Ok(EXIT_TIMEOUT);
             }
-            Ok(EXIT_TIMEOUT)
+            WaitOutcome::NoSuchJob => {
+                eprintln!("qex: there is no job with the id {raw_id}");
+                return Ok(EXIT_NO_SUCH_JOB);
+            }
+            WaitOutcome::Interrupted => return Ok(report_broken_wait(&ids, false)),
+            WaitOutcome::DiskGaveUp(shortage) => {
+                let Some(g) = grace.as_ref() else {
+                    continue;
+                };
+                let id = raw_id.parse::<uuid::Uuid>().unwrap_or_default();
+                let mut client = Client::connect_existing();
+                match give_up_on_disk(client.as_mut(), id, &shortage, g) {
+                    GaveUp::Stopped(code) => return Ok(code),
+                    // The job started: wait for it as for any job.
+                    GaveUp::JobMoved => grace = None,
+                }
+            }
         }
-        WaitOutcome::NoSuchJob => {
-            eprintln!("qex: there is no job with the id {raw_id}");
-            Ok(EXIT_NO_SUCH_JOB)
-        }
-        WaitOutcome::Interrupted => Ok(report_broken_wait(&ids, false)),
     }
 }
 
@@ -990,6 +1135,9 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
             false,
             deadline,
             args.timeout.as_deref(),
+            // This command attaches to a job that another command made, so it
+            // never gives up and never cancels (D13).
+            None,
         );
     }
 
@@ -1037,6 +1185,13 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                     eprintln!("qex: there is no job with the id {id}");
                     return Ok(EXIT_NO_SUCH_JOB);
                 }
+                // Only a reporter with the clock of D13 gives this, and this
+                // command attaches to jobs that other commands made.
+                WaitOutcome::DiskGaveUp(_) => bail!(
+                    "qex stopped this wait for a disk that outside programs hold, and this \
+                     command never does that. This is a fault of qex; use `qex status` to read \
+                     the job."
+                ),
                 // Give the code of a wait that stopped, and NOT `128 + N`. The
                 // job continues, so the caller must attach to it again.
                 WaitOutcome::Interrupted => {
@@ -1683,6 +1838,12 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
                 );
                 return Ok(EXIT_NO_SUCH_JOB);
             }
+            // Only a reporter with the clock of D13 gives this, and this command
+            // attaches to jobs that other commands made.
+            WaitOutcome::DiskGaveUp(_) => bail!(
+                "qex stopped this wait for a disk that outside programs hold, and this command \
+                 never does that. This is a fault of qex; use `qex status` to read the job."
+            ),
             // A signal stopped this wait. Name every job that this command
             // still watched, so the user attaches to all of them again.
             WaitOutcome::Interrupted => {
@@ -1850,6 +2011,9 @@ enum WaitOutcome {
     NoSuchJob,
     /// A signal stopped the wait. The job continues.
     Interrupted,
+    /// The job waited for disk space that no job of the queue holds, and the
+    /// grace passed (D13). Only a reporter with a clock gives this.
+    DiskGaveUp(Box<crate::disk::DiskShortage>),
 }
 
 /// True when a signal stopped the wait of this command.
@@ -1999,6 +2163,14 @@ struct ReasonReporter {
     /// True when the job started. The queue has nothing more to say.
     done: bool,
     next_test: Instant,
+    /// The clock of the grace for a disk that outside programs hold (D13). Only
+    /// a command that submitted the job and waits for it has one.
+    watch: Option<crate::disk::DiskWatch>,
+    /// The facts of the shortage, when the grace is over.
+    gave_up: Option<crate::disk::DiskShortage>,
+    /// True while the record holds a shortage. The wait then reads it once a
+    /// second, and not once in two seconds, so the grace ends near its limit.
+    watching_a_shortage: bool,
 }
 
 impl ReasonReporter {
@@ -2008,7 +2180,21 @@ impl ReasonReporter {
             quiet,
             done: false,
             next_test: Instant::now(),
+            watch: None,
+            gave_up: None,
+            watching_a_shortage: false,
         }
+    }
+
+    /// Gives this wait the grace of D13. `None` as the limit waits for ever.
+    fn with_disk_grace(mut self, limit: Option<Duration>) -> Self {
+        self.watch = Some(crate::disk::DiskWatch::new(limit));
+        self
+    }
+
+    /// Gives the shortage once, when the grace is over.
+    fn take_gave_up(&mut self) -> Option<crate::disk::DiskShortage> {
+        self.gave_up.take()
     }
 
     /// Asks for the state of the job, and reports a cause that changed.
@@ -2017,28 +2203,55 @@ impl ReasonReporter {
     /// stops at the moment that the job starts. A job that waits four hours in
     /// the queue and then runs for four more must not cost 14400 questions.
     fn poll(&mut self, raw_id: &str) {
-        if self.quiet || self.done || Instant::now() < self.next_test {
+        // `--quiet` silences the text and not the grace: a command that stops
+        // its wait must read the record whatever it prints.
+        if (self.quiet && self.watch.is_none()) || self.done || Instant::now() < self.next_test {
             return;
         }
-        self.next_test = Instant::now() + REASON_INTERVAL;
+        self.next_test = Instant::now()
+            + if self.watching_a_shortage {
+                Duration::from_secs(1)
+            } else {
+                REASON_INTERVAL
+            };
 
         // Use a SECOND connection. The first one holds the wait request, and
         // the coordinator answers that request when the job stops.
-        let status = match Client::connect_existing() {
+        let (status, from_the_coordinator) = match Client::connect_existing() {
             Some(mut client) => {
                 client.set_read_timeout(Some(REASON_INTERVAL)).ok();
-                match resolve_id_for_wait(&mut client, raw_id) {
+                let status = match resolve_id_for_wait(&mut client, raw_id) {
                     Ok(Some(id)) => match client.call(&Request::Status { id }) {
                         Ok(Response::Status { status }) => Some(*status),
                         _ => None,
                     },
                     _ => None,
-                }
+                };
+                (status, true)
             }
-            None => read_status_on_disk(raw_id).unwrap_or(None),
+            None => (read_status_on_disk(raw_id).unwrap_or(None), false),
         };
         if let Some(status) = status {
+            // Only a record that the COORDINATOR gave counts for the grace. The
+            // record on the disk outlives a coordinator that stopped, and the
+            // cause in it may be old.
+            self.watch_disk(&status, from_the_coordinator);
             self.note(&status);
+        }
+    }
+
+    /// Feeds the clock of the grace with one reading of the record.
+    fn watch_disk(&mut self, status: &JobStatus, from_the_coordinator: bool) {
+        let Some(watch) = self.watch.as_mut() else {
+            return;
+        };
+        let shortage = status
+            .blocked_disk
+            .as_ref()
+            .filter(|_| from_the_coordinator && status.state == JobState::Queued);
+        self.watching_a_shortage = shortage.is_some();
+        if watch.observe(Instant::now(), shortage) {
+            self.gave_up = shortage.cloned();
         }
     }
 
@@ -2315,6 +2528,9 @@ fn wait_through_coordinator(
             Ok(true) => break,
             Ok(false) => {
                 reporter.poll(raw_id);
+                if let Some(shortage) = reporter.take_gave_up() {
+                    return Ok(Some(WaitOutcome::DiskGaveUp(Box::new(shortage))));
+                }
                 continue;
             }
             // The socket itself failed. The coordinator is gone.
@@ -5997,6 +6213,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         );
     }
 
+    let disk_wait_limit_text = args.submit.disk_wait_limit.clone();
     let env_capture = if args.submit.no_env_capture {
         Some(EnvCapture::None)
     } else {
@@ -6040,6 +6257,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     spec.needs = resolve_dependencies(&mut client, &deps.needs, "--needs")?;
     spec.after = resolve_dependencies(&mut client, &deps.after, "--after")?;
     require_capabilities(&mut client, &spec)?;
+    let disk_limit = disk_wait_limit(&mut client, disk_wait_limit_text.as_deref())?;
 
     // Ask BEFORE the job exists, so this answer is about a decision that the
     // reader can still make.
@@ -6118,7 +6336,19 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
 
     let dir = paths::job_dir(&id)?;
     // `qex run` sets no limit on its own wait. `--timeout` limits the JOB.
-    stream_until_done(&mut client, id, &dir, !deduplicated, None, None)
+    let grace = disk_limit.map(|limit| DiskGrace {
+        limit,
+        started_here: !deduplicated,
+    });
+    stream_until_done(
+        &mut client,
+        id,
+        &dir,
+        !deduplicated,
+        None,
+        None,
+        grace.as_ref(),
+    )
 }
 
 /// Asks the coordinator to cancel this job if this command stops.
@@ -6269,6 +6499,10 @@ fn stream_until_done(
     deadline: Option<Instant>,
     // The limit as the reader wrote it, for the hint that attaches again.
     limit: Option<&str>,
+    // The grace for a disk that outside programs hold (D13). Only `qex run`
+    // gives one: `qex status --follow` attaches to a job that another command
+    // made.
+    grace: Option<&DiskGrace>,
 ) -> Result<i32> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -6279,6 +6513,7 @@ fn stream_until_done(
     // already why the job stopped, but a user whose job ANOTHER command stopped
     // knows nothing, and that user needs the sentence most.
     let mut stopped_here = false;
+    let mut watch = grace.map(|g| crate::disk::DiskWatch::new(g.limit));
 
     loop {
         if RUN_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -6360,6 +6595,23 @@ fn stream_until_done(
                 status_without_the_coordinator(client, id, dir, owns_job, &mut announced_loss)?
             }
         };
+
+        // The grace of D13. A record from a coordinator that stopped is not a
+        // reading: the cause in it may be old.
+        if let (Some(w), Some(g)) = (watch.as_mut(), grace) {
+            let shortage = status
+                .blocked_disk
+                .as_ref()
+                .filter(|_| status.state == JobState::Queued);
+            if w.observe(Instant::now(), shortage) {
+                if let Some(shortage) = shortage {
+                    match give_up_on_disk(Some(client), id, shortage, g) {
+                        GaveUp::Stopped(code) => return Ok(code),
+                        GaveUp::JobMoved => watch = None,
+                    }
+                }
+            }
+        }
 
         // Say why nothing happens yet. A user of `qex run` sees no output while
         // the job waits, and silence with no reason is the fault that qex
@@ -7213,6 +7465,7 @@ mod tests {
             queue_pause_secs: 0,
             blocked_reason: None,
             blocked_since: None,
+            blocked_disk: None,
             passed_by: 0,
             error: None,
             needs: vec![],
@@ -7650,6 +7903,7 @@ mod tests {
         assert_eq!(EXIT_JOB_SIGNAL, 98);
         assert_eq!(EXIT_OOM, 99);
         assert_eq!(EXIT_NO_RESULT, 100);
+        assert_eq!(EXIT_DISK_FULL, 101);
         assert_eq!(EXIT_QEX_FAILED, 121);
         assert_eq!(EXIT_WAIT_BROKEN, 122);
         assert_eq!(EXIT_EXPIRED, 123);

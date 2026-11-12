@@ -912,7 +912,7 @@ fn disk_wait(cfg: &Config, spec: &JobSpec, held: &Held, machine: &Machine) -> Op
                 held_reason,
             })
         }
-        crate::disk::Judgement::Outside { reason } => Some(Verdict::Wait {
+        crate::disk::Judgement::Outside { reason, .. } => Some(Verdict::Wait {
             blocker: Blocker::Machine,
             reason,
             held_reason: None,
@@ -922,6 +922,27 @@ fn disk_wait(cfg: &Config, spec: &JobSpec, held: &Held, machine: &Machine) -> Op
             reason: format!("{reason} This job never starts, so qex starts the jobs behind it."),
             held_reason: None,
         }),
+    }
+}
+
+/// The facts of a disk wait in the class `Machine`, for the record of the job
+/// (D13). `None` for every other verdict.
+fn disk_shortage_of(
+    cfg: &Config,
+    spec: &JobSpec,
+    held: &Held,
+    machine: &Machine,
+) -> Option<crate::disk::DiskShortage> {
+    let claim = spec.disk_claim();
+    match crate::disk::judge(
+        cfg.disk_rules(),
+        claim.as_ref(),
+        &spec.cwd,
+        &held.disks,
+        &machine.disks,
+    ) {
+        crate::disk::Judgement::Outside { shortage, .. } => Some(shortage),
+        _ => None,
     }
 }
 
@@ -1344,6 +1365,7 @@ fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: 
     job.status.state = JobState::Skipped;
     job.status.finished_at = Some(sys::now_secs());
     job.status.blocked_reason = None;
+    job.status.blocked_disk = None;
     job.status.error = Some(reason);
     job.status.caused_by = Some(root);
     let status = job.status.clone();
@@ -1424,6 +1446,7 @@ fn expire(
     // The queue reason goes into the text below, so this field becomes empty: a
     // job that stopped waits for nothing.
     job.status.blocked_reason = None;
+    job.status.blocked_disk = None;
     // Give the remedy that fits the cause.
     //
     // A job that waited for a job that it needs did not wait for capacity, and
@@ -1635,6 +1658,9 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     // reads the jobs.
     let mut chosen = None;
     let mut reasons: Vec<(uuid::Uuid, Option<String>)> = Vec::new();
+    // The jobs that wait for disk space which no job of this queue holds, with
+    // the facts (D13). A job that is not here has none.
+    let mut shortages: BTreeMap<uuid::Uuid, crate::disk::DiskShortage> = BTreeMap::new();
     let mut to_skip: Vec<(uuid::Uuid, String, uuid::Uuid)> = Vec::new();
     // What each job waits for, when it is not capacity.
     //
@@ -1755,6 +1781,11 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
                 reason,
                 held_reason,
             } => {
+                if blocker == Blocker::Machine {
+                    if let Some(shortage) = disk_shortage_of(&cfg, &job.spec, &held, &machine) {
+                        shortages.insert(id, shortage);
+                    }
+                }
                 if head.is_some() {
                     // A job behind a head that does not keep capacity. It gets
                     // its own reason, because no job holds it back.
@@ -1849,6 +1880,31 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
                 job.status.blocked_reason = reason;
                 dirty.insert(id);
             }
+        }
+    }
+
+    // Write the facts of each disk wait (D13) into the record of the job, and
+    // take them away from every queued job that has none now.
+    //
+    // The free space moves with every write on the disk, so it is not a reason
+    // to write the record: the record is written when the CAUSE changes (see
+    // `DiskShortage::same_cause`), and the number in memory is current.
+    for id in state.queue.clone() {
+        let Some(job) = state.jobs.get_mut(&id) else {
+            continue;
+        };
+        if job.status.state != JobState::Queued {
+            continue;
+        }
+        let now = shortages.remove(&id);
+        let changed = match (&job.status.blocked_disk, &now) {
+            (None, None) => false,
+            (Some(old), Some(new)) => !old.same_cause(new),
+            _ => true,
+        };
+        job.status.blocked_disk = now;
+        if changed {
+            dirty.insert(id);
         }
     }
 
@@ -2027,6 +2083,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         job.status.state = JobState::Starting;
         job.status.started_at = Some(sys::now_secs());
         job.status.blocked_reason = None;
+        job.status.blocked_disk = None;
         // The job starts, so it waits for nothing and no job passed it. A
         // record that kept these two values would tell a reader that a job
         // which operates is at the front of the queue.
@@ -2532,7 +2589,7 @@ mod tests {
     }
 
     /// Makes a state with one job in the queue, for the tests of the limit.
-    fn state_with(
+    pub(super) fn state_with(
         job_state: JobState,
         max_queue_time: Option<u64>,
         waited: u64,
@@ -4581,5 +4638,73 @@ mod disk_tests {
         let mut held = Held::default();
         held.add(&crate::job::JobStatus::new(&spec), &[]);
         assert!(held.disks.is_empty());
+    }
+
+    /// CLAIM D13: an outside wait gives the record its facts; a wait that the
+    /// jobs of this queue cause gives none, because it has an end.
+    #[test]
+    fn only_an_outside_wait_gives_a_shortage() {
+        let c = cfg("reserve_disk = \"0\"");
+        let m = machine(&c);
+        let s = disk_shortage_of(&c, &job(Some(50), "/work"), &Held::default(), &m)
+            .expect("50GB of 10GB free, and nothing in the queue holds it");
+        assert_eq!(s.kind, crate::disk::ShortageKind::Claim);
+        assert_eq!(s.claim, Some(50 * GB));
+        assert_eq!(s.free, Some(10 * GB));
+
+        let held = held_claim(8, "/elsewhere");
+        assert!(
+            disk_shortage_of(&c, &job(Some(5), "/work"), &held, &m).is_none(),
+            "the queue's own claims hold the space: waits-for-capacity"
+        );
+        assert!(
+            disk_shortage_of(&c, &job(Some(9), "/mnt/small/x"), &Held::default(), &m).is_none(),
+            "a claim larger than the filesystem is parked"
+        );
+        assert!(disk_shortage_of(&c, &job(Some(5), "/work"), &Held::default(), &m).is_none());
+        assert!(
+            disk_shortage_of(&c, &job(None, "/work"), &Held::default(), &m).is_none(),
+            "a job with no claim fits the default config"
+        );
+    }
+
+    /// CLAIM D13: the floor is an outside wait, for a job with no claim too.
+    #[test]
+    fn the_floor_gives_a_shortage_and_a_claim_of_zero_does_not() {
+        let c = cfg("min_free_disk = \"5GB\"");
+        let m = machine(&c);
+        let mut small = job(None, "/mnt/small/x");
+        small.cwd = "/mnt/small/proj".into();
+        let s = disk_shortage_of(&c, &small, &Held::default(), &m).expect("4GB < 5GB");
+        assert_eq!(s.kind, crate::disk::ShortageKind::Floor);
+        assert_eq!(s.floor, 5 * GB);
+        small.disk = Some(0);
+        small.disk_path = Some("/mnt/small/proj".into());
+        assert!(disk_shortage_of(&c, &small, &Held::default(), &m).is_none());
+    }
+
+    /// CLAIM D13 through `choose`: the record of a queued job holds the shortage
+    /// while the floor holds it, keeps the SAME cause without a rewrite when only
+    /// the free space moves, and loses it when the floor goes.
+    #[test]
+    fn choose_writes_and_clears_the_shortage_in_the_record() {
+        let mut state = super::tests::state_with(JobState::Queued, None, 0);
+        let id = state.queue[0];
+        // A floor that no real filesystem reaches.
+        state.cfg.system.min_free_disk = "1000000TB".into();
+        choose(&mut state);
+        let first = state.jobs[&id]
+            .status
+            .blocked_disk
+            .clone()
+            .expect("the floor holds the job, so the record holds the facts");
+        assert_eq!(first.kind, crate::disk::ShortageKind::Floor);
+
+        state.cfg.system.min_free_disk = "0".into();
+        choose(&mut state);
+        assert_eq!(
+            state.jobs[&id].status.blocked_disk, None,
+            "the cause went, so the facts go"
+        );
     }
 }

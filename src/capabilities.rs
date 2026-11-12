@@ -185,6 +185,7 @@ pub const ALL: &[&str] = &[
     "dedupe",
     "dependencies",
     "disk",
+    "disk-wait",
     "events",
     "groups",
     "history",
@@ -274,6 +275,29 @@ pub fn required_by(spec: &JobSpec) -> Vec<&'static str> {
         out.push("disk");
     }
     out
+}
+
+/// Tests a coordinator for `--disk-wait-limit` (D13).
+///
+/// The grace needs a coordinator that writes `blocked_disk` into the record. A
+/// coordinator without the capability never sets it, and a limit that the reader
+/// typed would then do nothing in silence, so qex refuses it. The default limit
+/// asks nothing: against such a coordinator the job waits as before.
+pub fn check_disk_wait(have: &[String], version: &str, pid: i32) -> Result<(), String> {
+    if have.iter().any(|h| h == "disk-wait") {
+        return Ok(());
+    }
+    Err(format!(
+        "the coordinator (pid {pid}) is version {version}, and it cannot obey \
+         --disk-wait-limit.\n\n\
+         That coordinator does not write the cause of a disk wait into the record, so the \
+         limit would do nothing, and qex refuses it. Without the option the job waits as it \
+         did before.\n\n\
+         The coordinator stops when no job operates, and the next command then starts one \
+         that can obey. To change it now:\n\
+         \x20   kill {pid}\n\n\
+         The jobs that operate now continue; a new coordinator reads the same records."
+    ))
 }
 
 /// Gives the option that a reader writes for one capability.
@@ -1222,5 +1246,28 @@ mod disk_tests {
         let mut sorted = ALL.to_vec();
         sorted.sort_unstable();
         assert_eq!(sorted, ALL.to_vec(), "ALL is sorted");
+    }
+
+    /// CLAIM D13: this build offers the grace, and the capability has a name.
+    #[test]
+    fn this_build_offers_the_disk_wait() {
+        assert!(ALL.contains(&"disk-wait"));
+    }
+
+    /// CLAIM D13 and D10: a limit that the reader typed is refused by a
+    /// coordinator that cannot obey it, with the option and the way to replace
+    /// the coordinator.
+    #[test]
+    fn an_explicit_disk_wait_limit_is_refused_by_a_coordinator_without_the_capability() {
+        let without: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "disk-wait")
+            .map(|c| c.to_string())
+            .collect();
+        let err = check_disk_wait(&without, "0.34.0", 77).unwrap_err();
+        assert!(err.contains("--disk-wait-limit"), "{err}");
+        assert!(err.contains("kill 77"), "{err}");
+        let with: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(check_disk_wait(&with, "0.34.0", 77).is_ok());
     }
 }

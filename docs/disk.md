@@ -144,7 +144,8 @@ need no key.
 
 **D11. The record carries the claim.** `spec.json` and `status.json` have the
 fields `disk` (bytes, or `null`) and `disk_path` (an absolute path, or `null`).
-`qex status` has a line `disk:`. A record that 0.33.0 wrote has neither field,
+`status.json` also has `blocked_disk` (D13): the facts of a disk wait that outside
+programs cause, or `null`. `qex status` has a line `disk:`. A record that 0.33.0 wrote has neither field,
 and it reads as a job with no claim: a job that operates across the upgrade holds
 no space. The JSON schemas name both fields (`qex schema job`, `qex schema
 status`, `qex schema pipeline`).

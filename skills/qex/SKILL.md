@@ -112,6 +112,7 @@ the job. A fault of those commands is 121, and never 1.
 | 98 | **A signal ended the job** — one that qex did not send, and that was not TERM or KILL. **Read the number in the record before you act**, because two causes give this code and need opposite answers: a fault inside the job, such as SIGSEGV or SIGABRT, means the work must change; a signal from outside, such as `kill -INT`, means somebody stopped you and the same command can run again. TERM and KILL give 125. The process that takes the signal is the command qex started: `-- sh -c my_binary` gives qex the shell, and a shell that survives its child exits 139, which qex reports as 97. |
 | 99 | **The kernel stopped the job for memory.** qex REPORTS this and acts on it in no way: no new attempt, no changed claim. qex reads a kill count that covers every program of your user, so it cannot say your job was the victim and cannot say the claim was too small — the machine can be full while your claim is correct. Compare the `usage` field with the claim, and submit again when the memory is free. macOS keeps no such count and gives 125 for the same kill, so never wait for 99 there. |
 | 100 | The job has not stopped, so there is no result. Only `qex status --quiet` with no wait gives it. |
+| 101 | **The disk is full, and the job did not run.** The job waited for disk space that programs outside the queue hold (`--disk-wait-limit`, 60 seconds by default), so qex cancelled it. stderr says what to free. Free the space and submit the job again. |
 | 121 | qex could not do what you asked. No job ran. |
 | 122 | Your wait stopped, and **the job continues.** Attach to it again. |
 | 123 | The job gave up in the queue. It reached its `--max-queue-time`. |
@@ -185,6 +186,25 @@ qex submit --wait --disk 0 --lock nix-gc -- nix-store --gc   # frees space
 which stops all work on a full disk when the owner sets it, does not hold it.
 qex learns no disk claim, so give the growth that you saw after the first run
 (`df`). Run `qex help disk`.
+
+**A disk that something else fills ends your wait with the code 101.**
+`qex submit --wait` and `qex run` stop when the job has waited 60 seconds for disk
+space that no job of this queue would free: a program outside the queue, or the
+files of earlier jobs, hold it (`waits-for-machine` in `qex info`). They cancel
+the job, write the filesystem, the free space and how much to free on stderr, and
+exit with **101**. No job ran, so free the space and submit the job again:
+
+```sh
+qex submit --wait --cpu 1 --mem 200MB --disk 0 --lock nix-gc -- nix-store --gc   # only if nix-store exists
+du -xsh ~/.cache /tmp /var/tmp 2>/dev/null    # find what holds the space
+```
+
+Or give a smaller `--disk`, or `--disk-path` on a filesystem with room. A job with
+`--disk 0` is exempt from the disk tests, so a cleanup job starts at once.
+`--disk-wait-limit 5m` waits longer; `none` waits for ever. There is no config
+key. A wait for the jobs of this queue (`waits-for-capacity`) never ends in 101.
+`qex wait` and `qex status --wait` never give up. Run `qex help disk`.
+
 
 ## A key, so a second run starts nothing
 

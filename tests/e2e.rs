@@ -19539,7 +19539,7 @@ fn a_cancel_of_many_ids_gives_a_line_for_each() {
 }
 
 // ---------------------------------------------------------------------------
-// Disk claims. Read `docs/disk.md` for the claims D1 to D12 that these tests
+// Disk claims. Read `docs/disk.md` for the claims D1 to D13 that these tests
 // name.
 // ---------------------------------------------------------------------------
 
@@ -19967,4 +19967,389 @@ fn the_help_pages_name_the_disk_claim() {
     }
     let submit = h.ok(&["submit", "--help"]);
     assert!(submit.contains("--disk") && submit.contains("--disk-path"));
+}
+
+// ---------------------------------------------------------------------------
+// The grace for a disk that outside programs hold (D13 of `docs/disk.md`).
+// ---------------------------------------------------------------------------
+
+/// A harness whose floor no wait can satisfy: the filesystem of the test never
+/// has `free + 1GB` free. The wait is of the class `waits-for-machine`, and the
+/// test can lift it by writing the config again.
+fn held_disk_harness(name: &str) -> (Harness, u64) {
+    let h0 = disk_harness(&format!("{name}0"), "0", "0");
+    let (_, free, _) = disk_of(&h0.root);
+    drop(h0);
+    let floor = free + (4u64 << 30);
+    (disk_harness(name, "0", &bytes_arg(floor)), floor)
+}
+
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).to_string()
+}
+
+/// CLAIM D13: `qex submit --wait` stops after the grace, cancels the job, exits
+/// with 101, and says what to free.
+#[test]
+fn submit_wait_gives_up_on_a_disk_that_outside_programs_hold() {
+    let (h, floor) = held_disk_harness("graceup");
+    let started = Instant::now();
+    let out = h.qex_within(
+        &["submit", "--wait", "--disk-wait-limit", "2s", "--", "true"],
+        Duration::from_secs(60),
+    );
+    let took = started.elapsed();
+    let said = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(101), "{said}");
+    assert!(
+        took >= Duration::from_secs(2),
+        "the grace is a floor on the wait: {took:?}"
+    );
+    for must in [
+        "min_free_disk",
+        &crate_size(floor),
+        "du -xsh",
+        "--disk 0",
+        "--disk-path",
+        "--disk-wait-limit",
+        "cancelled",
+    ] {
+        assert!(said.contains(must), "stderr lacks `{must}`:\n{said}");
+    }
+    let jobs = h.list_json();
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0]["state"], "cancelled", "the job did not run");
+}
+
+/// The size as `qex` writes it in a sentence, for the floor of a test.
+fn crate_size(bytes: u64) -> String {
+    let gb = bytes as f64 / (1u64 << 30) as f64;
+    if (gb - gb.round()).abs() < 0.05 {
+        format!("{}GB", gb.round() as u64)
+    } else {
+        format!("{gb:.1}GB")
+    }
+}
+
+/// CLAIM D13: `qex run` and `qex submit --follow` share the path.
+#[test]
+fn run_and_follow_give_up_the_same_way() {
+    let (h, _) = held_disk_harness("graceup-run");
+    let out = h.qex_within(
+        &["run", "--disk-wait-limit", "2s", "--", "true"],
+        Duration::from_secs(60),
+    );
+    assert_eq!(out.status.code(), Some(101), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("du -xsh"), "{}", stderr_of(&out));
+
+    let out = h.qex_within(
+        &[
+            "submit",
+            "--follow",
+            "--disk-wait-limit",
+            "2s",
+            "--",
+            "true",
+        ],
+        Duration::from_secs(60),
+    );
+    assert_eq!(out.status.code(), Some(101), "{}", stderr_of(&out));
+    assert!(
+        h.list_json().iter().all(|j| j["state"] == "cancelled"),
+        "{:?}",
+        h.list_json()
+    );
+}
+
+/// CLAIM D13: a claim that the free space does not hold gives the claim message,
+/// with the claim, the reserve and the bytes to free.
+#[test]
+fn a_claim_that_outside_programs_hold_back_gives_the_claim_message() {
+    let h0 = disk_harness("gracecl0", "0", "0");
+    let (_, free, total) = disk_of(&h0.root);
+    drop(h0);
+    if total < free + (8 << 20) {
+        eprintln!("skipped: the test filesystem is almost empty");
+        return;
+    }
+    let h = disk_harness("gracecl", &bytes_arg(free), "0");
+    let out = h.qex_within(
+        &[
+            "submit",
+            "--wait",
+            "--disk-wait-limit",
+            "2s",
+            "--disk",
+            "4MB",
+            "--",
+            "true",
+        ],
+        Duration::from_secs(60),
+    );
+    let said = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(101), "{said}");
+    for must in ["4MB", "reserve_disk", "free at least", "smaller --disk"] {
+        assert!(said.contains(must), "stderr lacks `{must}`:\n{said}");
+    }
+}
+
+/// CLAIM D13: space that is freed inside the grace lets the job start, and the
+/// command gives the exit code of the job.
+#[test]
+fn space_freed_inside_the_grace_lets_the_job_start() {
+    let (h, _) = held_disk_harness("gracefree");
+    let (_, _, _) = disk_of(&h.root);
+    let mut child = h
+        .command(&[
+            "submit",
+            "--wait",
+            "-q",
+            "--disk-wait-limit",
+            "40s",
+            "--",
+            "true",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    h.until("the job is queued", Duration::from_secs(30), || {
+        h.list_json().len() == 1
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    // Free the space: the floor goes.
+    h.write_config(
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         reserve_disk = \"0\"\nmin_free_disk = \"0\"\n",
+    );
+    let started = Instant::now();
+    let code = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s.code();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(40),
+            "the job must start after the floor goes"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(code, Some(0));
+    assert_eq!(h.list_json()[0]["state"], "completed");
+}
+
+/// CLAIM D13: a wait for the jobs of THIS queue (`waits-for-capacity`) is not
+/// given up, whatever the limit says.
+#[test]
+fn a_wait_for_the_jobs_of_the_queue_is_not_given_up() {
+    let h = disk_harness("gracecap", "0", "0");
+    let (_, free, _) = disk_of(&h.root);
+    let claim = bytes_arg(free / 10 * 6);
+    let first = h.submit(&["submit", "--disk", &claim, "--", "sleep", "7"]);
+    h.until("the first job starts", Duration::from_secs(45), || {
+        h.has_started(&first)
+    });
+    let started = Instant::now();
+    let out = h.qex_within(
+        &[
+            "submit",
+            "--wait",
+            "--disk-wait-limit",
+            "2s",
+            "--disk",
+            &claim,
+            "--",
+            "true",
+        ],
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the first job frees the space, so the wait ends in a start: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "the job waited for the first job, past the 2 seconds: {:?}",
+        started.elapsed()
+    );
+}
+
+/// CLAIM D13: without `--wait` the job is queued as before, whatever the limit.
+#[test]
+fn submit_without_wait_queues_the_job_and_records_the_cause() {
+    let (h, _) = held_disk_harness("gracenowait");
+    let id = h.submit(&["submit", "--", "true"]);
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(h.state_of(&id), "queued");
+    h.until(
+        "the record holds the cause",
+        Duration::from_secs(30),
+        || !h.status_json(&id)["blocked_disk"].is_null(),
+    );
+    let cause = h.status_json(&id)["blocked_disk"].clone();
+    assert_eq!(cause["kind"], "floor", "{cause}");
+    assert!(cause["free"].as_u64().is_some(), "{cause}");
+    assert!(cause["floor"].as_u64().unwrap() > 0, "{cause}");
+    h.qex(&["cancel", &id]);
+}
+
+/// CLAIM D13: `qex wait` and `qex status --wait` attach to a job that another
+/// command made. They never give up and never cancel.
+#[test]
+fn qex_wait_and_status_wait_do_not_give_up() {
+    let (h, _) = held_disk_harness("gracewait");
+    let id = h.submit(&["submit", "--", "true"]);
+    h.until(
+        "the record holds the cause",
+        Duration::from_secs(30),
+        || !h.status_json(&id)["blocked_disk"].is_null(),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let out = h.qex_within(&["wait", &id, "--timeout", "4s"], Duration::from_secs(60));
+    assert_eq!(out.status.code(), Some(124), "{}", stderr_of(&out));
+    let out = h.qex_within(
+        &["status", &id, "--wait", "--timeout", "4s"],
+        Duration::from_secs(60),
+    );
+    assert_eq!(out.status.code(), Some(124), "{}", stderr_of(&out));
+    assert_eq!(h.state_of(&id), "queued");
+    h.qex(&["cancel", &id]);
+}
+
+/// CLAIM D13: `none` waits for ever. The wait ends at the time limit of the
+/// reader (124), and the job stays in the queue.
+#[test]
+fn a_limit_of_none_waits_until_the_reader_stops() {
+    let (h, _) = held_disk_harness("gracenone");
+    let out = h.qex_within(
+        &[
+            "submit",
+            "--wait",
+            "--disk-wait-limit",
+            "none",
+            "--wait-timeout",
+            "5s",
+            "--",
+            "true",
+        ],
+        Duration::from_secs(60),
+    );
+    assert_eq!(out.status.code(), Some(124), "{}", stderr_of(&out));
+    let jobs = h.list_json();
+    assert_eq!(jobs[0]["state"], "queued");
+    h.qex(&["cancel", jobs[0]["id"].as_str().unwrap()]);
+}
+
+/// CLAIM D13: the job was cancelled, so it freed its dedupe key. The second
+/// submission of the same work is a new job and not an answer that names the old
+/// one.
+#[test]
+fn a_retry_after_the_cleanup_is_a_new_job() {
+    let (h, _) = held_disk_harness("gracededupe");
+    let out = h.qex_within(
+        &[
+            "submit",
+            "--wait",
+            "--disk-wait-limit",
+            "2s",
+            "--dedupe-key",
+            "build-x",
+            "--",
+            "true",
+        ],
+        Duration::from_secs(60),
+    );
+    assert_eq!(out.status.code(), Some(101), "{}", stderr_of(&out));
+    let again = h.qex(&["submit", "--dedupe-key", "build-x", "--", "true"]);
+    assert!(again.status.success());
+    assert!(
+        !stderr_of(&again).contains("started no job"),
+        "the key was free: {}",
+        stderr_of(&again)
+    );
+    assert_eq!(h.list_json().len(), 2);
+}
+
+/// CLAIM D13: a job that another command made (a dedupe key gave it) is not
+/// cancelled by this command. The wait stops with 101 and says so.
+#[test]
+fn a_job_that_another_command_made_is_not_cancelled() {
+    let (h, _) = held_disk_harness("gracefrom");
+    let id = h.submit(&["submit", "--dedupe-key", "shared", "--", "true"]);
+    let out = h.qex_within(
+        &[
+            "submit",
+            "--wait",
+            "--disk-wait-limit",
+            "2s",
+            "--dedupe-key",
+            "shared",
+            "--",
+            "true",
+        ],
+        Duration::from_secs(60),
+    );
+    let said = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(101), "{said}");
+    assert!(said.contains("still in the queue"), "{said}");
+    assert!(said.contains(&format!("qex cancel {id}")), "{said}");
+    assert_eq!(h.state_of(&id), "queued");
+    h.qex(&["cancel", &id]);
+}
+
+/// CLAIM D13: the code 101 is in every table, and the pages name the option.
+#[test]
+fn the_pages_name_the_code_101_and_the_option() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    assert!(readme.contains("101") && readme.contains("--disk-wait-limit"));
+    for page in ["skills/qex/SKILL.md", "docs/agents.md", "docs/reference.md"] {
+        let text = std::fs::read_to_string(root.join(page)).unwrap();
+        assert!(
+            text.contains("| 101 |"),
+            "{page} must hold 101 in its table of exit codes"
+        );
+        assert!(
+            text.contains("--disk-wait-limit"),
+            "{page} must name --disk-wait-limit"
+        );
+    }
+    let h = disk_harness("gracehelp", "0", "0");
+    for topic in ["exit-codes", "agents", "disk"] {
+        let text = h.ok(&["help", topic]);
+        assert!(text.contains("101"), "`qex help {topic}` must name 101");
+    }
+    assert!(h.ok(&["help", "disk"]).contains("--disk-wait-limit"));
+    assert!(h.ok(&["submit", "--help"]).contains("--disk-wait-limit"));
+    assert!(h.ok(&["schema", "status"]).contains("blocked_disk"));
+    let disk = std::fs::read_to_string(root.join("docs/disk.md")).unwrap();
+    assert!(disk.contains("**D13."));
+}
+
+/// CLAIM D13: the limit belongs to a wait. `qex submit` without `--wait` refuses
+/// it, in the way that `--quiet` is refused, and queues no job.
+#[test]
+fn the_limit_needs_a_wait() {
+    let h = disk_harness("gracerefuse", "0", "0");
+    let out = h.qex(&["submit", "--disk-wait-limit", "5s", "--", "true"]);
+    assert_eq!(out.status.code(), Some(121), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("needs `--wait`"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(h.list_json().is_empty());
+    let out = h.qex(&[
+        "submit",
+        "--wait",
+        "--disk-wait-limit",
+        "soon",
+        "--",
+        "true",
+    ]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(stderr_of(&out).contains("--disk-wait-limit"));
+    assert!(h.list_json().is_empty());
 }

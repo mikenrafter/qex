@@ -216,6 +216,16 @@ pub struct SubmitArgs {
     #[arg(long, value_name = "PATH")]
     pub disk_path: Option<PathBuf>,
 
+    /// How long a command that waits for the job (`qex run`, or a submission that
+    /// waits) waits for a disk that something outside the queue holds.
+    ///
+    /// When the job has waited for disk space that no job of this queue would
+    /// free for this long without a break, the command cancels the job, says what
+    /// to free, and exits with the code 101. The default is `60s`. `0` and `none`
+    /// wait for ever. There is no config key. Run `qex help disk`.
+    #[arg(long, value_name = "TIME", value_parser = parse_disk_wait_limit)]
+    pub disk_wait_limit: Option<String>,
+
     /// A name for the job, to show in `qex list`.
     ///
     /// Letters, numbers, `-`, `_` and `.` only. It must not start with `-`.
@@ -1415,6 +1425,11 @@ mod tests {
     }
 }
 
+/// Checks `--disk-wait-limit` while the command line is read, and keeps the text.
+fn parse_disk_wait_limit(text: &str) -> Result<String, String> {
+    crate::disk::parse_wait_limit(Some(text)).map(|_| text.to_string())
+}
+
 #[cfg(test)]
 mod disk_tests {
     use super::*;
@@ -1468,5 +1483,34 @@ mod disk_tests {
             panic!("not a run");
         };
         assert_eq!(r.submit.disk, Some(1 << 30));
+    }
+
+    /// CLAIM D13: `--disk-wait-limit` parses on `submit` and on `run`, refuses a
+    /// word that is no duration, and is absent by default.
+    #[test]
+    fn disk_wait_limit_parses() {
+        assert_eq!(submit(&[]).unwrap().disk_wait_limit, None);
+        assert_eq!(
+            submit(&["--disk-wait-limit", "30s"])
+                .unwrap()
+                .disk_wait_limit
+                .as_deref(),
+            Some("30s")
+        );
+        assert_eq!(
+            submit(&["--disk-wait-limit", "none"])
+                .unwrap()
+                .disk_wait_limit
+                .as_deref(),
+            Some("none")
+        );
+        let err = submit(&["--disk-wait-limit", "soon"]).unwrap_err();
+        assert!(err.contains("--disk-wait-limit"), "{err}");
+        let cli =
+            Cli::try_parse_from(["qex", "run", "--disk-wait-limit", "5m", "--", "true"]).unwrap();
+        let Some(Command::Run(r)) = cli.command else {
+            panic!("not a run");
+        };
+        assert_eq!(r.submit.disk_wait_limit.as_deref(), Some("5m"));
     }
 }

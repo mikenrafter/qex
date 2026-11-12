@@ -541,6 +541,7 @@ pub fn plan_abort(
                 next.state = JobState::Cancelled;
                 next.finished_at = Some(now);
                 next.blocked_reason = None;
+                next.blocked_disk = None;
                 // A cancel that a person asked for leaves no error text. See
                 // `cancel_queued` in the daemon module.
                 next.error = None;

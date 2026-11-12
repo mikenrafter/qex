@@ -426,6 +426,20 @@ pub const STATUS: &str = r##"{
       "type": ["string", "null"],
       "description": "The reason that the job waits in the queue. The value is null for a job that started. The text names the holder of the capacity: the jobs of this queue, another user, the machine, or the size of the job."
     },
+    "blocked_disk": {
+      "type": ["object", "null"],
+      "description": "The facts of a wait for disk space that programs outside this queue hold, while the cause holds. The value is null for every other job. A command that submitted the job and waits for it cancels the job when this value has been there for the whole `--disk-wait-limit` (60 seconds by default) and exits with 101.",
+      "properties": {
+        "kind": { "type": "string", "enum": ["claim", "floor", "unreadable"], "description": "claim: the claim and the reserve do not fit the free space. floor: the filesystem is below `min_free_disk`. unreadable: qex cannot read the filesystem." },
+        "path": { "type": "string", "description": "The path whose filesystem is short." },
+        "free": { "type": ["integer", "null"], "description": "The free bytes when qex measured. The value is as old as the last change of the cause." },
+        "total": { "type": ["integer", "null"], "description": "The size of the filesystem in bytes." },
+        "claim": { "type": ["integer", "null"], "description": "The claim of the job in bytes, or null for a job with no claim." },
+        "reserve": { "type": "integer", "description": "`reserve_disk` in bytes." },
+        "floor": { "type": "integer", "description": "`min_free_disk` in bytes." },
+        "held": { "type": "integer", "description": "The bytes that the jobs of this queue claim on the filesystem." }
+      }
+    },
     "blocked_since": {
       "type": ["integer", "null"],
       "description": "The time when this job first failed the capacity test at the front of the queue, in seconds after the Unix epoch. Read it to see how long the front of the queue has not moved."

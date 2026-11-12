@@ -589,6 +589,14 @@ pub struct JobStatus {
     /// A reader uses it to see how long the front of the queue has not moved.
     #[serde(default)]
     pub blocked_since: Option<u64>,
+    /// The facts of a wait for disk in the class `waits-for-machine`, while the
+    /// cause holds. `None` for every other state of a job.
+    ///
+    /// The sentence is in `blocked_reason`, for a person. A command that
+    /// submitted the job and waits for it reads this value, and it ends its wait
+    /// when the cause holds for the grace (D13 of `docs/disk.md`).
+    #[serde(default)]
+    pub blocked_disk: Option<crate::disk::DiskShortage>,
     /// The number of jobs that qex started after this job reached the front of
     /// the queue.
     ///
@@ -727,6 +735,7 @@ impl JobStatus {
             queue_pause_secs: 0,
             blocked_reason: None,
             blocked_since: None,
+            blocked_disk: None,
             passed_by: 0,
             error: None,
             needs: spec.needs.clone(),

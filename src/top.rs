@@ -1497,6 +1497,7 @@ mod tests {
             queue_pause_secs: 0,
             blocked_reason: None,
             blocked_since: None,
+            blocked_disk: None,
             passed_by: 0,
             error: None,
             needs: vec![],

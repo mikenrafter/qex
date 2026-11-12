@@ -229,6 +229,7 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 // the error field.
                 job.status.error = Some(note);
                 job.status.blocked_reason = None;
+                job.status.blocked_disk = None;
                 let status = job.status.clone();
                 job::write_status(&dir, &status).ok();
                 log(&format!("the supervisor of the job {id} left no result"));
@@ -587,6 +588,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             // text does not belong in `blocked_reason`.
             status.error = Some(message);
             status.blocked_reason = None;
+            status.blocked_disk = None;
             job::write_status(&dir, &status)?;
 
             crate::hook::fire(crate::hook::Origin::Supervisor, &dir, &status);

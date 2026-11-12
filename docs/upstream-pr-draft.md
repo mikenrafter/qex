@@ -37,6 +37,10 @@ Body (it becomes the commit message of the squash):
       still runs.
     - The capability `disk`, so an earlier coordinator refuses nothing in
       silence: the CLI names `--disk` and gives the command that replaces it.
+    - A grace for a disk wait that has no end (D13): `qex submit --wait` and
+      `qex run` cancel a job that has waited 60 seconds (`--disk-wait-limit`) for
+      space that programs outside the queue hold, say what to free, and exit
+      with the new code 101. This part can be a separate pull request.
     - `disk` and `disk_path` in the records, `qex status`, `qex info`
       (`disks` in the JSON), the JSON schemas, `qex help disk` and the agent
       page. Records of earlier versions read as a job with no claim.

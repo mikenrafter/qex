@@ -153,6 +153,10 @@ Exit codes
       99        THE KERNEL STOPPED THE JOB FOR MEMORY. qex reports this with no
                 configuration. Give a larger `--mem` and submit the work again.
       100       the job has not stopped, so there is no result.
+      101       THE DISK IS FULL AND THE JOB DID NOT RUN. It waited for disk
+                space that programs outside the queue hold (`--disk-wait-limit`,
+                60s) and qex cancelled it. stderr says what to free. Free it
+                and submit again.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
       123       the job gave up in the queue. It reached `--max-queue-time`.
@@ -303,6 +307,13 @@ disk`. A job with no `--disk` is not held by it.
 which stops all work on a full disk when the owner sets it, does not hold it.
 qex learns no disk claim, so give the growth that you saw after the first run
 (`df`). Run `qex help disk`.
+
+A disk that something else fills ends your wait with the code 101. `qex submit
+--wait` and `qex run` stop when the job has waited 60 seconds for disk space that
+no job of this queue would free. They cancel the job, say on stderr what to free,
+and exit 101; no job ran. Free the space and submit again (`du -xsh`, `qex submit
+--wait --disk 0 --lock nix-gc -- nix-store --gc`, a smaller `--disk`, or
+`--disk-path`). `--disk-wait-limit 5m` waits longer, `none` for ever.
 
 Give each submission a key
 --------------------------
@@ -1948,6 +1959,19 @@ What qex does not do
 qex learns no disk claim, runs no cleanup command, counts the claims of its own
 queue only (not the claims of other users), and limits no job.
 
+A WAIT THAT HAS NO END BECOMES AN ERROR. When a job of `qex submit --wait`,
+`qex run` or `qex submit --follow` has waited for disk in the class
+`waits-for-machine` for 60 seconds without a break (the floor, or a claim that
+outside programs prevent), qex cancels the job, writes on stderr the filesystem,
+the free space and how much to free, and exits with the code 101. No job ran.
+Free the space and submit again: `qex submit --wait --cpu 1 --mem 200MB --disk 0
+--lock nix-gc -- nix-store --gc` (if nix exists), `du -xsh` on the usual places, a
+smaller `--disk`, or `--disk-path` elsewhere. `--disk-wait-limit TIME` changes the
+grace for one call; `0` and `none` wait for ever. There is no config key and no
+environment variable. A wait for the jobs of this queue (`waits-for-capacity`)
+never ends this way, a `qex submit` without `--wait` queues the job, and `qex wait`
+and `qex status --wait` never give up.
+
 `qex info` shows each filesystem that matters: the free space, the claims, the
 reserve and the floor. `qex status` shows the claim of a job, and `qex status
 --json` has `disk` and `disk_path`.
@@ -2357,6 +2381,10 @@ obeys it.
       99        THE KERNEL STOPPED THE JOB FOR MEMORY. qex reports this with no
                 configuration. See the note below.
       100       the job has not stopped, so there is no result.
+      101       THE DISK IS FULL AND THE JOB DID NOT RUN. It waited for disk
+                space that programs outside the queue hold (`--disk-wait-limit`,
+                60s) and qex cancelled it. stderr says what to free. Free it
+                and submit again.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
       123       the job gave up in the queue. It reached `--max-queue-time`.

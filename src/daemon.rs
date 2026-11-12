@@ -1453,6 +1453,7 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                 status.state = JobState::Failed;
                 status.finished_at = Some(sys::now_secs());
                 status.blocked_reason = None;
+                status.blocked_disk = None;
                 status.error = Some(note);
                 retire_the_pids(&mut status);
                 job::write_status(&path, &status).ok();
@@ -1474,6 +1475,7 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                 status.state = JobState::Failed;
                 status.finished_at = Some(sys::now_secs());
                 status.blocked_reason = None;
+                status.blocked_disk = None;
                 status.error = Some(if same_boot {
                     "the coordinator stopped, and neither the job nor its supervisor continued"
                         .to_string()
@@ -1635,6 +1637,7 @@ fn requeue_unstarted(status: &mut crate::job::JobStatus, supervisor_was_recorded
     status.finished_at = None;
     status.error = None;
     status.blocked_reason = None;
+    status.blocked_disk = None;
     status.supervisor_start_token = None;
     status.assigned.clear();
     status.forced = false;
@@ -2936,6 +2939,7 @@ fn cancel_queued(coord: &Arc<Coordinator>, id: uuid::Uuid, reason: Option<String
     job.status.state = JobState::Cancelled;
     job.status.finished_at = Some(sys::now_secs());
     job.status.blocked_reason = None;
+    job.status.blocked_disk = None;
     job.status.error = reason;
     let status = job.status.clone();
     state.queue.retain(|q| *q != id);

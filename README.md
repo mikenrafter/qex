@@ -280,6 +280,12 @@ jobs that operate, is at least the claim. A job with no `--disk` is not held by
 it. [Disk claims](docs/disk.md) has the rules, the floor `min_free_disk`, and
 what qex does not do.
 
+**A wait for a disk that other programs fill ends in an error.** `qex submit --wait`
+and `qex run` stop after 60 seconds (`--disk-wait-limit`, `none` waits for ever)
+when the space is held outside the queue. They cancel the job, say what to free,
+and exit with the code **101**; no job ran. A wait for the jobs of the queue itself
+continues as before.
+
 **`guess` and `half` claim one half of the budget**, so two such jobs operate
 together. `full` and `max` claim all of it, so the job operates alone. qex
 calculates the word at the submission, and the record then holds an exact value.

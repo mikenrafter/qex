@@ -3,7 +3,7 @@
 //! A job can claim disk space with `--disk SIZE`. The claim is a promise and
 //! not a limit, in the same way as a claim of memory: qex stops no job that
 //! writes more than it claimed. The claim decides what STARTS and when.
-//! Read `docs/disk.md` for the whole design. The numbers D1 to D12 in the
+//! Read `docs/disk.md` for the whole design. The numbers D1 to D13 in the
 //! comments below are the numbers of that page.
 //!
 //! # Why the free space is read, and not a budget
@@ -23,9 +23,11 @@
 
 use crate::sys::Fs;
 use crate::units::format_size;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// The space that one job claims, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,9 +60,263 @@ pub enum Judgement {
     /// The space is short, whatever the jobs of this queue do: programs outside
     /// the queue, or the files of earlier jobs, hold it. qex does not control
     /// that, so this wait has no known end.
-    Outside { reason: String },
+    Outside {
+        reason: String,
+        /// The facts of the shortage, for a command that waits (D13).
+        shortage: DiskShortage,
+    },
     /// The job can never start: the claim is larger than the filesystem.
     Never { reason: String },
+}
+
+/// Why a job waits for disk in the class `waits-for-machine` (D7), as facts.
+///
+/// The record of the job holds it as `blocked_disk` while the cause holds, and a
+/// command that submitted the job and waits reads it (D13). The sentence in
+/// `blocked_reason` is for a person; this value is for the program.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskShortage {
+    pub kind: ShortageKind,
+    /// The path whose filesystem is short: the `--disk-path`, or the directory of
+    /// the job for the floor.
+    pub path: PathBuf,
+    /// The free space when the scheduler measured it. `None`: qex could not read it.
+    pub free: Option<u64>,
+    /// The size of the filesystem. `None`: qex could not read it.
+    pub total: Option<u64>,
+    /// The claim of the job, or `None` for a job with no claim (the floor holds it).
+    pub claim: Option<u64>,
+    /// `reserve_disk` when the shortage was measured.
+    pub reserve: u64,
+    /// `min_free_disk` when the shortage was measured.
+    pub floor: u64,
+    /// The claims of the jobs of this queue on the filesystem (D3 counts them).
+    pub held: u64,
+}
+
+/// Which test of the disk holds the job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortageKind {
+    /// The claim and the reserve do not fit the free space (D3, D4).
+    Claim,
+    /// The filesystem is below `min_free_disk` (D8).
+    Floor,
+    /// qex cannot read the filesystem (D3).
+    Unreadable,
+}
+
+impl DiskShortage {
+    /// The free space that the job needs before it starts, or `None` when qex
+    /// cannot say.
+    ///
+    /// It is the number that D3 compares with the free space: the claim, the
+    /// reserve and the claims that the queue holds on the filesystem. The floor
+    /// (D8) is a second test, so a job below the floor needs the larger of the
+    /// two.
+    pub fn needed(&self) -> Option<u64> {
+        let claimed = self
+            .claim
+            .map(|c| c.saturating_add(self.reserve).saturating_add(self.held));
+        match self.kind {
+            ShortageKind::Claim => claimed,
+            ShortageKind::Floor => Some(claimed.unwrap_or(0).max(self.floor)),
+            ShortageKind::Unreadable => None,
+        }
+    }
+
+    /// The bytes to free, for the free space `free`. `None` when qex cannot say.
+    pub fn to_free(&self, free: Option<u64>) -> Option<u64> {
+        Some(self.needed()?.saturating_sub(free?))
+    }
+
+    /// True when `other` holds for the same cause. The free space is not part of
+    /// the cause, because it moves with every write on the disk: the record is
+    /// written when the cause changes, and not at each pass.
+    pub fn same_cause(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.path == other.path
+            && self.total == other.total
+            && self.claim == other.claim
+            && self.reserve == other.reserve
+            && self.floor == other.floor
+            && self.held == other.held
+    }
+}
+
+/// The grace of a command that waits (D13): how long a job may wait for disk in
+/// the class `waits-for-machine` before the command stops.
+pub const DEFAULT_WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+/// Reads `--disk-wait-limit`. `None` in the answer means: wait for ever.
+pub fn parse_wait_limit(text: Option<&str>) -> Result<Option<Duration>, String> {
+    match text {
+        None => Ok(Some(DEFAULT_WAIT_LIMIT)),
+        Some(t) => crate::units::parse_duration(t).map_err(|e| format!("--disk-wait-limit: {e}")),
+    }
+}
+
+/// The clock of the grace. It runs while the shortage holds, and it starts
+/// again after any break.
+pub struct DiskWatch {
+    limit: Option<Duration>,
+    since: Option<Instant>,
+}
+
+impl DiskWatch {
+    pub fn new(limit: Option<Duration>) -> Self {
+        Self { limit, since: None }
+    }
+
+    /// Feeds one reading of the record of the job. `shortage` is `None` when the
+    /// job does not wait for disk in the class `waits-for-machine`. Gives `true`
+    /// when the grace is over.
+    pub fn observe(&mut self, now: Instant, shortage: Option<&DiskShortage>) -> bool {
+        if shortage.is_none() {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        match self.limit {
+            Some(limit) => now.saturating_duration_since(since) >= limit,
+            None => false,
+        }
+    }
+}
+
+/// What the message of D13 needs besides the shortage.
+pub struct Advice<'a> {
+    pub shortage: &'a DiskShortage,
+    /// The free space now, if the command measured it. It replaces the value in
+    /// the record, which is as old as the last change of the cause.
+    pub free_now: Option<u64>,
+    pub id: uuid::Uuid,
+    /// The grace that passed. `None`: the command did not wait by a limit.
+    pub limit: Option<Duration>,
+    /// True when `nix-store` is on the PATH.
+    pub nix: bool,
+    /// True when this command cancelled the job.
+    pub cancelled: bool,
+}
+
+/// Writes a limit in the form that the reader types it: `60s`, `5m`.
+fn limit_text(limit: Duration) -> String {
+    let secs = limit.as_secs();
+    if secs > 120 && secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Writes the message of D13.
+///
+/// The message is for an agent that has one chance to read it: the numbers come
+/// first, and then the commands that it can type.
+pub fn advice_text(advice: &Advice) -> String {
+    let s = advice.shortage;
+    let id = advice.id;
+    let mut out = String::new();
+
+    let waited = match advice.limit {
+        Some(l) => format!("for {}", limit_text(l)),
+        None => "for a long time".to_string(),
+    };
+    let fate = if advice.cancelled {
+        format!("The job {id} was cancelled. It did not run.")
+    } else {
+        format!("The job {id} is still in the queue. Remove it with `qex cancel {id}`.")
+    };
+    out.push_str(&format!(
+        "qex: the job waited {waited} for disk space that no job of this queue holds, so \
+         the wait would have no end. {fate}\n"
+    ));
+
+    let free = advice.free_now.or(s.free);
+    let path = s.path.display();
+    match s.kind {
+        ShortageKind::Unreadable => {
+            out.push_str(&format!(
+                "qex: qex cannot read the free space of {path}, so it cannot test the claim of \
+                 {}. Check that the path exists and that qex can read it, or give another \
+                 --disk-path.\n",
+                s.claim.map(show).unwrap_or_else(|| "this job".into())
+            ));
+        }
+        ShortageKind::Claim | ShortageKind::Floor => {
+            let free_text = free.map(show).unwrap_or_else(|| "unknown".into());
+            let total_text = s
+                .total
+                .map(|t| format!(" of {}", show(t)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "qex: the filesystem of {path} has {free_text} free{total_text}.\n"
+            ));
+            if let Some(claim) = s.claim {
+                out.push_str(&format!(
+                    "qex: the job claims {} and `reserve_disk` keeps {} free{}, so it needs {} \
+                     free to start.\n",
+                    show(claim),
+                    show(s.reserve),
+                    if s.held > 0 {
+                        format!(
+                            " ({} more are claimed by the jobs of this queue)",
+                            show(s.held)
+                        )
+                    } else {
+                        String::new()
+                    },
+                    s.needed().map(show).unwrap_or_default(),
+                ));
+            }
+            if s.kind == ShortageKind::Floor {
+                out.push_str(&format!(
+                    "qex: `min_free_disk` is {}, and qex starts no job on this filesystem below \
+                     it.\n",
+                    show(s.floor)
+                ));
+            }
+            if let Some(to_free) = s.to_free(free) {
+                out.push_str(&format!(
+                    "qex: to start it, free at least {} on this filesystem.\n",
+                    show(to_free)
+                ));
+            }
+        }
+    }
+
+    out.push_str("qex: what you can do:\n");
+    if advice.nix {
+        out.push_str(
+            "qex:   free space with a job that is exempt from the disk test, and queue it \
+             with a lock so that two do not run together:\n\
+             qex:     qex submit --wait --cpu 1 --mem 200MB --disk 0 --lock nix-gc -- \
+             nix-store --gc\n",
+        );
+    }
+    out.push_str(&format!(
+        "qex:   find what holds the space: `du -xsh {path}/* 2>/dev/null | sort -h | tail`, \
+         `du -xsh ~/.cache /tmp /var/tmp 2>/dev/null`, `df -h {path}`\n"
+    ));
+    if s.claim.is_some() && s.kind != ShortageKind::Unreadable {
+        out.push_str(
+            "qex:   give a smaller --disk, when the claim is larger than the job writes\n",
+        );
+    }
+    out.push_str(
+        "qex:   put the job's files on a filesystem with room: --disk-path DIR\n\
+         qex:   a job with `--disk 0` is exempt from every disk test, so a job that frees \
+         space can start now\n",
+    );
+    out.push_str(&format!(
+        "qex:   when you have freed the space, submit the job again. To wait longer for the \
+         disk, give --disk-wait-limit TIME (now {}; `none` waits for ever)\n",
+        match advice.limit {
+            Some(l) => limit_text(l),
+            None => "none".into(),
+        }
+    ));
+    out
 }
 
 /// Reads the filesystem of a path. A test gives its own.
@@ -158,6 +414,16 @@ pub fn judge(
         // nobody asked for on this job, so it passes (D8).
         return match claim {
             Some(c) => Judgement::Outside {
+                shortage: DiskShortage {
+                    kind: ShortageKind::Unreadable,
+                    path: c.path.clone(),
+                    free: None,
+                    total: None,
+                    claim: Some(c.bytes),
+                    reserve: rules.reserve,
+                    floor: rules.floor,
+                    held: 0,
+                },
                 reason: format!(
                     "waits for disk: qex cannot read the free space of {}, so it cannot test \
                      the claim of {}. Check that the path exists and that qex can read it, or \
@@ -174,6 +440,20 @@ pub fn judge(
     // D8: the floor holds every job but a claim of 0, with a claim or without.
     if rules.floor > 0 && fs.free < rules.floor {
         return Judgement::Outside {
+            shortage: DiskShortage {
+                kind: ShortageKind::Floor,
+                path: path.to_path_buf(),
+                free: Some(fs.free),
+                total: Some(fs.total),
+                claim: claim.map(|c| c.bytes),
+                reserve: rules.reserve,
+                floor: rules.floor,
+                held: if claim.is_some() {
+                    held_on(held, fs.dev, disks)
+                } else {
+                    0
+                },
+            },
             reason: format!(
                 "waits for disk: the filesystem of {} has {} free, and `min_free_disk` is {}. \
                  qex starts no job there below that floor. qex does not control the programs \
@@ -217,6 +497,16 @@ pub fn judge(
     // somebody else (`Outside`).
     if held_here == 0 || fs.free.saturating_add(held_here) < own {
         return Judgement::Outside {
+            shortage: DiskShortage {
+                kind: ShortageKind::Claim,
+                path: claim.path.clone(),
+                free: Some(fs.free),
+                total: Some(fs.total),
+                claim: Some(claim.bytes),
+                reserve: rules.reserve,
+                floor: rules.floor,
+                held: held_here,
+            },
             reason: format!(
                 "waits for disk: the filesystem of {} has {} free, and this job claims {} with \
                  {} in reserve (`reserve_disk`). Programs outside this queue, or the files of \
@@ -336,7 +626,7 @@ mod tests {
         let d = two_filesystems();
         let c = claim(9, "/work");
         let got = judge(rules(2, 0), Some(&c), Path::new("/work"), &[], &d);
-        let Judgement::Outside { reason } = got else {
+        let Judgement::Outside { reason, .. } = got else {
             panic!("no job holds the space, so the wait has no known end: {got:?}");
         };
         assert!(reason.contains("waits for disk"), "{reason}");
@@ -561,7 +851,7 @@ mod tests {
     fn the_floor_holds_a_job_that_claims_nothing() {
         let d = two_filesystems();
         let got = judge(rules(0, 5), None, Path::new("/mnt/small/proj"), &[], &d);
-        let Judgement::Outside { reason } = got else {
+        let Judgement::Outside { reason, .. } = got else {
             panic!("4GB is under a floor of 5GB: {got:?}");
         };
         assert!(reason.contains("min_free_disk"), "{reason}");
@@ -626,7 +916,7 @@ mod tests {
         let d = Disks::with(Box::new(|_| None));
         let c = claim(1, "/gone/away");
         let got = judge(rules(0, 0), Some(&c), Path::new("/"), &[], &d);
-        let Judgement::Outside { reason } = got else {
+        let Judgement::Outside { reason, .. } = got else {
             panic!("an unreadable path must not pass in silence: {got:?}");
         };
         assert!(reason.contains("/gone/away"), "{reason}");
@@ -660,5 +950,370 @@ mod tests {
             .expect("a path below an existing directory is readable");
         assert_eq!(here.dev, below.dev);
         assert!(here.total > 0 && here.free <= here.total);
+    }
+}
+
+/// CLAIM D13: the facts of the shortage, the clock of the grace, the limit and
+/// the message.
+#[cfg(test)]
+mod grace_tests {
+    use super::*;
+
+    const GB: u64 = 1 << 30;
+    const MB: u64 = 1 << 20;
+
+    fn fs(dev: u64, free: u64, total: u64) -> Fs {
+        Fs { dev, free, total }
+    }
+
+    fn claim(bytes: u64, path: &str) -> DiskClaim {
+        DiskClaim {
+            bytes,
+            path: PathBuf::from(path),
+        }
+    }
+
+    fn shortage_of(got: Judgement) -> DiskShortage {
+        match got {
+            Judgement::Outside { shortage, .. } => shortage,
+            other => panic!("expected an outside wait: {other:?}"),
+        }
+    }
+
+    /// CLAIM D13: the shortage of a claim holds the numbers that the message
+    /// needs, and the free space that the job needs before it starts.
+    #[test]
+    fn an_outside_claim_wait_carries_the_numbers() {
+        let d = Disks::fixed(vec![("/", fs(1, 5 * GB, 100 * GB))]);
+        let c = claim(8 * GB, "/work");
+        let s = shortage_of(judge(
+            Rules {
+                reserve: GB,
+                floor: 0,
+            },
+            Some(&c),
+            Path::new("/work"),
+            &[],
+            &d,
+        ));
+        assert_eq!(s.kind, ShortageKind::Claim);
+        assert_eq!(s.path, PathBuf::from("/work"));
+        assert_eq!(s.free, Some(5 * GB));
+        assert_eq!(s.total, Some(100 * GB));
+        assert_eq!(s.claim, Some(8 * GB));
+        assert_eq!(s.reserve, GB);
+        assert_eq!(s.held, 0);
+        assert_eq!(s.needed(), Some(9 * GB), "the claim and the reserve");
+    }
+
+    /// CLAIM D13: the claims of the queue are part of what the job needs to
+    /// start at once (D3), so they are in the shortage.
+    #[test]
+    fn the_need_includes_the_claims_that_the_queue_holds() {
+        let d = Disks::fixed(vec![("/", fs(1, 5 * GB, 100 * GB))]);
+        let held = [claim(2 * GB, "/other")];
+        let c = claim(50 * GB, "/work");
+        let s = shortage_of(judge(
+            Rules {
+                reserve: GB,
+                floor: 0,
+            },
+            Some(&c),
+            Path::new("/work"),
+            &held,
+            &d,
+        ));
+        assert_eq!(s.held, 2 * GB);
+        assert_eq!(s.needed(), Some(53 * GB));
+    }
+
+    /// CLAIM D13: the floor is its own kind, and a job with no claim has the
+    /// floor as its need.
+    #[test]
+    fn a_floor_wait_carries_the_floor() {
+        let d = Disks::fixed(vec![("/", fs(1, GB, 100 * GB))]);
+        let s = shortage_of(judge(
+            Rules {
+                reserve: 0,
+                floor: 3 * GB,
+            },
+            None,
+            Path::new("/work"),
+            &[],
+            &d,
+        ));
+        assert_eq!(s.kind, ShortageKind::Floor);
+        assert_eq!(s.claim, None);
+        assert_eq!(s.floor, 3 * GB);
+        assert_eq!(s.needed(), Some(3 * GB));
+    }
+
+    /// CLAIM D13: a claimed job below the floor needs the larger of the floor
+    /// and the claim with its reserve.
+    #[test]
+    fn a_floor_wait_of_a_claimed_job_needs_the_larger_number() {
+        let d = Disks::fixed(vec![("/", fs(1, GB, 100 * GB))]);
+        let c = claim(10 * GB, "/work");
+        let s = shortage_of(judge(
+            Rules {
+                reserve: GB,
+                floor: 3 * GB,
+            },
+            Some(&c),
+            Path::new("/work"),
+            &[],
+            &d,
+        ));
+        assert_eq!(s.kind, ShortageKind::Floor);
+        assert_eq!(s.needed(), Some(11 * GB));
+    }
+
+    /// CLAIM D13: a path that qex cannot read is a shortage with no numbers.
+    #[test]
+    fn an_unreadable_path_is_a_shortage_with_no_free_space() {
+        let d = Disks::fixed(vec![]);
+        let c = claim(GB, "/gone");
+        let s = shortage_of(judge(
+            Rules {
+                reserve: 0,
+                floor: 0,
+            },
+            Some(&c),
+            Path::new("/gone"),
+            &[],
+            &d,
+        ));
+        assert_eq!(s.kind, ShortageKind::Unreadable);
+        assert_eq!(s.free, None);
+        assert_eq!(s.needed(), None);
+    }
+
+    /// CLAIM D13: the free space moves with every write, so it is not part of
+    /// the cause. A record is rewritten only when the cause changes.
+    #[test]
+    fn the_free_space_is_not_part_of_the_cause() {
+        let a = DiskShortage {
+            kind: ShortageKind::Claim,
+            path: "/w".into(),
+            free: Some(5 * MB),
+            total: Some(100 * MB),
+            claim: Some(40 * MB),
+            reserve: MB,
+            floor: 0,
+            held: 0,
+        };
+        let mut b = a.clone();
+        b.free = Some(6 * MB);
+        assert!(a.same_cause(&b));
+        b.claim = Some(41 * MB);
+        assert!(!a.same_cause(&b));
+        let mut c = a.clone();
+        c.kind = ShortageKind::Floor;
+        assert!(!a.same_cause(&c));
+    }
+
+    /// CLAIM D13: a record written by this build reads back, and a record of an
+    /// earlier build has no such field.
+    #[test]
+    fn the_shortage_round_trips_through_json() {
+        let a = DiskShortage {
+            kind: ShortageKind::Floor,
+            path: "/w".into(),
+            free: Some(1),
+            total: None,
+            claim: None,
+            reserve: 2,
+            floor: 3,
+            held: 4,
+        };
+        let text = serde_json::to_string(&a).unwrap();
+        assert!(text.contains("\"kind\":\"floor\""), "{text}");
+        assert_eq!(serde_json::from_str::<DiskShortage>(&text).unwrap(), a);
+    }
+
+    fn some_shortage() -> DiskShortage {
+        DiskShortage {
+            kind: ShortageKind::Claim,
+            path: "/w".into(),
+            free: Some(MB),
+            total: Some(100 * MB),
+            claim: Some(40 * MB),
+            reserve: MB,
+            floor: 0,
+            held: 0,
+        }
+    }
+
+    /// CLAIM D13: the grace runs from the first reading and ends at the limit.
+    #[test]
+    fn the_grace_ends_at_the_limit() {
+        let t0 = Instant::now();
+        let mut w = DiskWatch::new(Some(Duration::from_secs(60)));
+        let s = some_shortage();
+        assert!(!w.observe(t0, Some(&s)), "the clock starts here");
+        assert!(!w.observe(t0 + Duration::from_secs(59), Some(&s)));
+        assert!(w.observe(t0 + Duration::from_secs(60), Some(&s)));
+    }
+
+    /// CLAIM D13: a break starts the clock again.
+    #[test]
+    fn a_break_starts_the_clock_again() {
+        let t0 = Instant::now();
+        let mut w = DiskWatch::new(Some(Duration::from_secs(60)));
+        let s = some_shortage();
+        w.observe(t0, Some(&s));
+        assert!(!w.observe(t0 + Duration::from_secs(50), None), "a break");
+        assert!(!w.observe(t0 + Duration::from_secs(55), Some(&s)));
+        assert!(
+            !w.observe(t0 + Duration::from_secs(100), Some(&s)),
+            "45 seconds since the new start"
+        );
+        assert!(w.observe(t0 + Duration::from_secs(115), Some(&s)));
+    }
+
+    /// CLAIM D13: no limit, no end.
+    #[test]
+    fn no_limit_never_ends() {
+        let t0 = Instant::now();
+        let mut w = DiskWatch::new(None);
+        let s = some_shortage();
+        w.observe(t0, Some(&s));
+        assert!(!w.observe(t0 + Duration::from_secs(86_400 * 30), Some(&s)));
+    }
+
+    /// CLAIM D13: the default is 60 seconds, and the words for "for ever" are
+    /// the words of the other durations.
+    #[test]
+    fn the_limit_has_a_default_and_a_way_to_turn_it_off() {
+        assert_eq!(DEFAULT_WAIT_LIMIT, Duration::from_secs(60));
+        assert_eq!(parse_wait_limit(None), Ok(Some(Duration::from_secs(60))));
+        assert_eq!(
+            parse_wait_limit(Some("30s")),
+            Ok(Some(Duration::from_secs(30)))
+        );
+        assert_eq!(
+            parse_wait_limit(Some("5m")),
+            Ok(Some(Duration::from_secs(300)))
+        );
+        for off in ["0", "none", "never", "unlimited"] {
+            assert_eq!(parse_wait_limit(Some(off)), Ok(None), "{off}");
+        }
+        let err = parse_wait_limit(Some("soon")).unwrap_err();
+        assert!(err.contains("--disk-wait-limit"), "{err}");
+    }
+
+    fn advice<'a>(s: &'a DiskShortage, nix: bool) -> Advice<'a> {
+        Advice {
+            shortage: s,
+            free_now: None,
+            id: uuid::Uuid::nil(),
+            limit: Some(Duration::from_secs(60)),
+            nix,
+            cancelled: true,
+        }
+    }
+
+    /// CLAIM D13: the message names the place, the numbers and the way out.
+    #[test]
+    fn the_message_names_the_numbers_and_the_ways_out() {
+        let s = DiskShortage {
+            kind: ShortageKind::Claim,
+            path: "/var/build".into(),
+            free: Some(2 * GB),
+            total: Some(100 * GB),
+            claim: Some(6 * GB),
+            reserve: GB,
+            floor: 0,
+            held: 0,
+        };
+        let t = advice_text(&advice(&s, true));
+        for must in [
+            "/var/build",
+            "2GB",
+            "6GB",
+            "1GB",
+            "5GB", // 7GB needed - 2GB free
+            "qex submit --wait --cpu 1 --mem 200MB --disk 0 --lock nix-gc -- nix-store --gc",
+            "du -xsh",
+            "--disk-path",
+            "--disk 0",
+            "--disk-wait-limit",
+            "60s",
+            "cancelled",
+        ] {
+            assert!(t.contains(must), "the message lacks `{must}`:\n{t}");
+        }
+        assert!(
+            t.contains("smaller --disk"),
+            "a smaller claim is a way out:\n{t}"
+        );
+    }
+
+    /// CLAIM D13: no `nix-store`, no nix advice.
+    #[test]
+    fn the_nix_command_appears_only_when_nix_is_there() {
+        let s = some_shortage();
+        let t = advice_text(&advice(&s, false));
+        assert!(!t.contains("nix-store"), "{t}");
+        assert!(t.contains("du -xsh"), "{t}");
+    }
+
+    /// CLAIM D13: the floor message names the key.
+    #[test]
+    fn the_floor_message_names_the_key() {
+        let s = DiskShortage {
+            kind: ShortageKind::Floor,
+            path: "/work".into(),
+            free: Some(GB),
+            total: Some(100 * GB),
+            claim: None,
+            reserve: 0,
+            floor: 3 * GB,
+            held: 0,
+        };
+        let t = advice_text(&advice(&s, true));
+        assert!(t.contains("min_free_disk"), "{t}");
+        assert!(t.contains("3GB") && t.contains("2GB"), "{t}");
+    }
+
+    /// CLAIM D13: an unreadable path has no numbers, and the message says what
+    /// to check.
+    #[test]
+    fn the_unreadable_message_names_the_path() {
+        let s = DiskShortage {
+            kind: ShortageKind::Unreadable,
+            path: "/gone".into(),
+            free: None,
+            total: None,
+            claim: Some(GB),
+            reserve: 0,
+            floor: 0,
+            held: 0,
+        };
+        let t = advice_text(&advice(&s, false));
+        assert!(t.contains("/gone") && t.contains("cannot read"), "{t}");
+    }
+
+    /// CLAIM D13: a job that this command did not start stays in the queue, and
+    /// the message says so and names the command that removes it.
+    #[test]
+    fn a_job_left_in_the_queue_is_named() {
+        let s = some_shortage();
+        let mut a = advice(&s, false);
+        a.cancelled = false;
+        let t = advice_text(&a);
+        assert!(t.contains("still in the queue"), "{t}");
+        assert!(t.contains("qex cancel"), "{t}");
+        assert!(!t.contains("was cancelled"), "{t}");
+    }
+
+    /// CLAIM D13: the measured free space replaces the old number in the record.
+    #[test]
+    fn the_free_space_measured_now_wins() {
+        let s = some_shortage();
+        let mut a = advice(&s, false);
+        a.free_now = Some(7 * MB);
+        let t = advice_text(&a);
+        assert!(t.contains("7MB"), "{t}");
     }
 }
