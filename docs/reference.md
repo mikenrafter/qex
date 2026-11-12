@@ -405,6 +405,15 @@ If you do not know the size of a task, use a word in place of a number:
 qex calculates these words against the budget, and not against the free memory
 of the moment. The same command thus always gives the same claim.
 
+### Disk space
+
+A job can claim disk space with `--disk SIZE` and `--disk-path PATH`. The claim
+is a promise and not a limit, like the other claims. qex compares the claims of
+the jobs that operate with the free space of each filesystem, less
+`[system] reserve_disk`, and `[system] min_free_disk` can stop all work on a
+filesystem that is nearly full. [Disk claims](disk.md) states every rule, and
+the things that qex does not do.
+
 ### qex learns the size of a task
 
 qex records what each job really used and uses those numbers as the claim for
@@ -1466,6 +1475,8 @@ mem = "75%"           # memory that qex can use; 90% under single-user
 
 [system]
 reserve_mem  = "2GB"  # memory to keep free; 512MB under single-user
+reserve_disk = "1GB"  # disk to keep free after the claims of jobs with --disk
+min_free_disk = "0"   # start no job on a filesystem with less free than this; 0 = off
 max_pressure = 20     # maximum PSI memory pressure (Linux only)
 
 [enforce]

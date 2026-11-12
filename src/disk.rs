@@ -63,13 +63,16 @@ pub enum Judgement {
     Never { reason: String },
 }
 
+/// Reads the filesystem of a path. A test gives its own.
+pub type Probe = Box<dyn Fn(&Path) -> Option<Fs>>;
+
 /// The measurements of the filesystems for one pass of the scheduler.
 ///
 /// A path gets ONE measurement for the whole pass, as [`crate::sched`] does for
 /// the memory. Two jobs of one pass then see the same number, and the pass does
 /// not call the system twice for one path.
 pub struct Disks {
-    probe: Box<dyn Fn(&Path) -> Option<Fs>>,
+    probe: Probe,
     seen: RefCell<BTreeMap<PathBuf, Option<Fs>>>,
 }
 
@@ -79,7 +82,7 @@ impl Disks {
         Self::with(Box::new(crate::sys::filesystem))
     }
 
-    pub fn with(probe: Box<dyn Fn(&Path) -> Option<Fs>>) -> Self {
+    pub fn with(probe: Probe) -> Self {
         Self {
             probe,
             seen: RefCell::new(BTreeMap::new()),
@@ -128,6 +131,14 @@ pub fn held_on(held: &[DiskClaim], dev: u64, disks: &Disks) -> u64 {
 /// `cwd` is the directory of the job: a job with no claim is tested against
 /// the floor on the filesystem of its directory (D8). `held` holds the claims
 /// of the jobs that operate now.
+///
+/// The order of the tests is the order of the claims. The exemption comes
+/// first (D6), then the floor (D8), then the size (D5), then the free space
+/// without the jobs of this queue (D7, `Outside`), and last the free space with
+/// them (D3, `Siblings`). The order decides the class of a wait that two tests
+/// would both give: when the space is short even if every job of this queue
+/// stopped, the jobs of this queue are not the cause, so the class says
+/// `Outside` and not `Siblings`.
 pub fn judge(
     rules: Rules,
     claim: Option<&DiskClaim>,
@@ -135,9 +146,107 @@ pub fn judge(
     held: &[DiskClaim],
     disks: &Disks,
 ) -> Judgement {
-    let _ = (rules, claim, cwd, held, disks);
-    // STUB: the red tests of the first commit fail against this line.
+    // D6: a claim of 0 is a decision, and no disk test holds the job.
+    if claim.is_some_and(|c| c.bytes == 0) {
+        return Judgement::Fits;
+    }
+
+    let path = claim.map(|c| c.path.as_path()).unwrap_or(cwd);
+    let Some(fs) = disks.stat(path) else {
+        // D3. A claim is a rule that the user asked for, so a path that qex
+        // cannot read is a wait that says why. The floor is a protection that
+        // nobody asked for on this job, so it passes (D8).
+        return match claim {
+            Some(c) => Judgement::Outside {
+                reason: format!(
+                    "waits for disk: qex cannot read the free space of {}, so it cannot test \
+                     the claim of {}. Check that the path exists and that qex can read it, or \
+                     give another --disk-path. qex does not control this, so this wait has no \
+                     known end.",
+                    c.path.display(),
+                    show(c.bytes)
+                ),
+            },
+            None => Judgement::Fits,
+        };
+    };
+
+    // D8: the floor holds every job but a claim of 0, with a claim or without.
+    if rules.floor > 0 && fs.free < rules.floor {
+        return Judgement::Outside {
+            reason: format!(
+                "waits for disk: the filesystem of {} has {} free, and `min_free_disk` is {}. \
+                 qex starts no job there below that floor. qex does not control the programs \
+                 that fill the disk, so this wait has no known end. qex starts the jobs behind \
+                 this one while the space is not free. Free some space. A job that frees space \
+                 starts with `--disk 0`.",
+                path.display(),
+                show(fs.free),
+                show(rules.floor)
+            ),
+        };
+    }
+
+    let Some(claim) = claim else {
+        return Judgement::Fits;
+    };
+
+    // D5. The same test as the submission, in case the configuration changed.
+    if let Some(never) = never_text(rules, claim, fs) {
+        return Judgement::Never { reason: never };
+    }
+
+    // D3 and D4. The claim and the reserve must fit the free space.
+    let own = claim.bytes.saturating_add(rules.reserve);
+    if fs.free < own {
+        return Judgement::Outside {
+            reason: format!(
+                "waits for disk: the filesystem of {} has {} free, and this job claims {} with \
+                 {} in reserve (`reserve_disk`). Programs outside this queue, or the files of \
+                 earlier jobs, hold the space. qex does not control them, so this wait has no \
+                 known end. qex starts the jobs behind this one while the space is not free. \
+                 Free some space, or give a smaller --disk.",
+                claim.path.display(),
+                show(fs.free),
+                show(claim.bytes),
+                show(rules.reserve)
+            ),
+        };
+    }
+
+    // D3. The claims of the jobs that operate now.
+    let held_here = held_on(held, fs.dev, disks);
+    if fs.free < own.saturating_add(held_here) {
+        return Judgement::Siblings {
+            fact: format!(
+                "waits for disk: this job claims {} on {}, the filesystem has {} free, the \
+                 jobs of this queue claim {} there, and {} must stay free (`reserve_disk`).",
+                show(claim.bytes),
+                claim.path.display(),
+                show(fs.free),
+                show(held_here),
+                show(rules.reserve)
+            ),
+        };
+    }
     Judgement::Fits
+}
+
+/// Gives the sentence for a claim that no free space can ever satisfy, or
+/// `None` when the claim can start some day (D5).
+fn never_text(rules: Rules, claim: &DiskClaim, fs: Fs) -> Option<String> {
+    if claim.bytes.saturating_add(rules.reserve) <= fs.total {
+        return None;
+    }
+    Some(format!(
+        "this job claims {} on {} with {} in reserve (`reserve_disk`), and the filesystem \
+         holds {} in total. Give a smaller --disk, lower `reserve_disk` in the configuration, \
+         or use another --disk-path.",
+        show(claim.bytes),
+        claim.path.display(),
+        show(rules.reserve),
+        show(fs.total)
+    ))
 }
 
 /// Tests a claim against the size of its filesystem, for the submission.
@@ -146,9 +255,16 @@ pub fn judge(
 /// and not a wait that never ends (D5). A path that qex cannot read gives no
 /// error here: the scheduler says it on every pass.
 pub fn check_size(rules: Rules, claim: &DiskClaim, disks: &Disks) -> Result<(), String> {
-    let _ = (rules, claim, disks);
-    // STUB: the red tests of the first commit fail against this line.
-    Ok(())
+    if claim.bytes == 0 {
+        return Ok(());
+    }
+    let Some(fs) = disks.stat(&claim.path) else {
+        return Ok(());
+    };
+    match never_text(rules, claim, fs) {
+        Some(text) => Err(format!("this job can never start: {text}")),
+        None => Ok(()),
+    }
 }
 
 /// Writes the size of a filesystem for a sentence: `3.1GB`.

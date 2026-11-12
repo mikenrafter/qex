@@ -169,6 +169,23 @@ of the same command. A job that the kernel stopped for memory teaches qex
 nothing today, so give a larger `--mem` yourself. `qex status --json` gives
 `max_rss` and `cpu_secs`.
 
+**A job that writes much to the disk claims the disk also.** Give `--disk SIZE`,
+and `--disk-path PATH` when the files go to another filesystem than the
+directory of the job. A disk claim is a promise and not a limit. qex starts the
+job when the free space of that filesystem, less `[system] reserve_disk` and the
+claims of the jobs that operate, is at least SIZE. The reason in `qex list`
+begins `waits for disk`. A job with no `--disk` is not held by it.
+
+```sh
+qex submit --wait --cpu 2 --mem 4GB --disk 6GB -- cargo build --release
+qex submit --wait --disk 0 --lock nix-gc -- nix-store --gc   # frees space
+```
+
+`--disk 0` is for a job that FREES space: the floor `[system] min_free_disk`,
+which stops all work on a full disk when the owner sets it, does not hold it.
+qex learns no disk claim, so give the growth that you saw after the first run
+(`df`). Run `qex help disk`.
+
 ## A key, so a second run starts nothing
 
 ```sh

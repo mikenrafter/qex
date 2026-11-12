@@ -1520,6 +1520,16 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     if let Some(key) = &s.dedupe_key {
         println!("dedupe:    {key}");
     }
+    if let Some(bytes) = s.disk {
+        let on = s.disk_path.clone().unwrap_or_else(|| s.cwd.clone());
+        if bytes == 0 {
+            println!(
+                "disk:      0B on {on} (the job claims no space, and the disk floor does not hold it)"
+            );
+        } else {
+            println!("disk:      {} on {on}", format_size(bytes));
+        }
+    }
     if !s.claims.is_empty() {
         println!(
             "claims:    {}",
@@ -4641,6 +4651,25 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                 format_size(mem_budget)
             );
 
+            // The filesystems that matter (D12). `None` is an earlier
+            // coordinator, and the honest word for it is `unknown`.
+            match &disks {
+                None => println!(
+                    "disk:            unknown; this coordinator is version {version} and it \
+                     does not report the disk"
+                ),
+                Some(list) => {
+                    for (index, d) in list.iter().enumerate() {
+                        let label = if index == 0 {
+                            "disk:           "
+                        } else {
+                            "                "
+                        };
+                        println!("{label} {}", disk_line(d));
+                    }
+                }
+            }
+
             // Say what the other users hold. The measurement is the one that
             // the scheduler used, so this answer and the reason of a job that
             // waits name the same numbers.
@@ -4723,6 +4752,35 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
         }
         other => report(other),
     }
+}
+
+/// Writes one filesystem for `qex info`.
+fn disk_line(d: &crate::proto::DiskReport) -> String {
+    let mut line = format!(
+        "{}: {} free of {}; {} claimed by {}",
+        d.path,
+        format_size(d.free),
+        format_size(d.total),
+        format_size(d.claimed),
+        count_of(d.holders, "running job"),
+    );
+    if d.waiting > 0 {
+        line.push_str(&format!(", {} waiting", d.waiting));
+    }
+    line.push_str(&format!(
+        "; keep {} free after a claim",
+        format_size(d.reserve)
+    ));
+    if d.floor > 0 {
+        line.push_str(&format!(
+            "; no job starts below {} free",
+            format_size(d.floor)
+        ));
+    }
+    if d.free < d.floor.max(d.reserve) {
+        line.push_str(" (BELOW THE LEVEL THAT QEX KEEPS)");
+    }
+    line
 }
 
 /// Writes a loud line when a person paused the queue or a lock.

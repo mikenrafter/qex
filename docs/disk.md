@@ -183,6 +183,13 @@ job adds, and not a margin on top of a margin.
 **N5. No enforcement.** A claim is a promise. A job with a quota or a `ulimit`
 that you set yourself is limited. A job that qex started is not.
 
+**N6. No protection from a filesystem that hangs.** qex reads the free space with
+one system call for each path in each pass, and the coordinator makes that call
+while it holds its queue. A network mount whose server does not answer can hold
+that call for ever, and the queue stops with it, as any program that reads that
+mount would stop. Do not give `--disk-path` on a network mount that can go away.
+The records and the claims of a local disk have no such risk.
+
 ## Checked on real mounts
 
 The unit tests set the free space of filesystems that do not exist. The end-to-end

@@ -2493,8 +2493,7 @@ fn handle_info(coord: &Arc<Coordinator>, peer: Option<i32>) -> Response {
 
     let earlier = crate::pause::for_an_earlier_cli(&state.paused.queue);
     Response::Info {
-        // STUB: the red tests of the first commit fail against this line.
-        disks: None,
+        disks: Some(disk_reports(&state)),
         pools: Some(pools),
         pid: std::process::id() as i32,
         version: crate::version::VERSION.to_string(),
@@ -2528,6 +2527,75 @@ fn handle_info(coord: &Arc<Coordinator>, peer: Option<i32>) -> Response {
             head_passed_by: state.head.as_ref().map(|h| h.passed_by),
         })),
     }
+}
+
+/// Reports the filesystems that matter to the queue now (D12).
+///
+/// The filesystem that holds the records of qex is always the first one: it is
+/// the first to fill, and a reader of `qex info` on a quiet machine still sees
+/// the number. Each filesystem with a claim of a job that operates or waits
+/// follows, in the order of its path. Two paths on one device are one entry.
+fn disk_reports(state: &State) -> Vec<crate::proto::DiskReport> {
+    let disks = crate::disk::Disks::system();
+    let rules = state.cfg.disk_rules();
+    let mut out: Vec<(u64, crate::proto::DiskReport)> = Vec::new();
+
+    /// Finds the entry of the filesystem that holds a path, and makes it when
+    /// it is new.
+    fn slot(
+        out: &mut Vec<(u64, crate::proto::DiskReport)>,
+        disks: &crate::disk::Disks,
+        rules: crate::disk::Rules,
+        path: &std::path::Path,
+    ) -> Option<usize> {
+        let fs = disks.stat(path)?;
+        if let Some(at) = out.iter().position(|(dev, _)| *dev == fs.dev) {
+            return Some(at);
+        }
+        out.push((
+            fs.dev,
+            crate::proto::DiskReport {
+                path: path.display().to_string(),
+                free: fs.free,
+                total: fs.total,
+                claimed: 0,
+                holders: 0,
+                waiting: 0,
+                reserve: rules.reserve,
+                floor: rules.floor,
+            },
+        ));
+        Some(out.len() - 1)
+    }
+
+    if let Ok(dir) = paths::state_dir() {
+        slot(&mut out, &disks, rules, &dir);
+    }
+
+    // Sorted: the same claims give the same list on each call.
+    let mut claims: Vec<(std::path::PathBuf, u64, bool)> = state
+        .jobs
+        .values()
+        .filter(|j| j.status.state.is_active() || j.status.state == JobState::Queued)
+        .filter_map(|j| {
+            let c = j.status.disk_claim()?;
+            (c.bytes > 0).then(|| (c.path, c.bytes, j.status.state.is_active()))
+        })
+        .collect();
+    claims.sort();
+    for (path, bytes, running) in claims {
+        let Some(at) = slot(&mut out, &disks, rules, &path) else {
+            continue;
+        };
+        let report = &mut out[at].1;
+        if running {
+            report.claimed = report.claimed.saturating_add(bytes);
+            report.holders += 1;
+        } else {
+            report.waiting += 1;
+        }
+    }
+    out.into_iter().map(|(_, r)| r).collect()
 }
 
 fn handle_submit(
@@ -2668,6 +2736,20 @@ fn handle_submit(
         if let Err(reason) = crate::sched::pool_check(&state.cfg, &spec) {
             release_dedupe(&mut state, id);
             return Response::error(ErrorKind::WrongState, reason);
+        }
+
+        // A disk claim that no free space can ever satisfy is a refusal too
+        // (D5). The job would wait with no end, and an empty disk does not
+        // make a larger filesystem.
+        if let Some(claim) = spec.disk_claim() {
+            if let Err(reason) = crate::disk::check_size(
+                state.cfg.disk_rules(),
+                &claim,
+                &crate::disk::Disks::system(),
+            ) {
+                release_dedupe(&mut state, id);
+                return Response::error(ErrorKind::WrongState, reason);
+            }
         }
 
         match crate::sched::size_check(&state.cfg, spec.cpu, spec.mem) {

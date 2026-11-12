@@ -19945,8 +19945,8 @@ fn the_help_pages_name_the_disk_claim() {
         "`qex help agents` must name --disk"
     );
     assert!(
-        agents.contains("not a limit") || agents.contains("promise"),
-        "and say that it is a promise"
+        agents.to_lowercase().contains("a promise and not a limit"),
+        "and say that it is a promise and not a limit"
     );
     let topic = h.ok(&["help", "disk"]);
     for word in [

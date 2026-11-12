@@ -27,6 +27,7 @@ pub const TOPICS: &[&str] = &[
     "job-file",
     "config",
     "resources",
+    "disk",
     "states",
     "events",
     "output",
@@ -46,6 +47,7 @@ pub fn topic(name: &str) -> Option<&'static str> {
         "job-file" | "jobfile" | "job" => Some(JOB_FILE),
         "config" | "configuration" => Some(CONFIG),
         "resources" | "resource" | "budget" => Some(RESOURCES),
+        "disk" | "disk-claims" | "diskclaims" => Some(DISK),
         "states" | "state" => Some(STATES),
         "events" | "event" | "stream" => Some(EVENTS),
         "output" | "json" => Some(OUTPUT),
@@ -287,6 +289,21 @@ A claim that is larger than the whole budget still runs: qex starts the job
 alone when nothing else operates, and the field `forced` is true. The job can
 then swap or stop for memory, and that result is data.
 
+A job that writes much to the disk claims the disk also. Give `--disk SIZE`, and
+`--disk-path PATH` when the files go to another filesystem than the directory of
+the job. A DISK CLAIM IS A PROMISE AND NOT A LIMIT. qex starts the job when the
+free space of that filesystem, less `[system] reserve_disk` and the claims of the
+jobs that operate, is at least SIZE. The reason in `qex list` begins `waits for
+disk`. A job with no `--disk` is not held by it.
+
+    qex submit --wait --cpu 2 --mem 4GB --disk 6GB -- cargo build --release
+    qex submit --wait --disk 0 --lock nix-gc -- nix-store --gc
+
+`--disk 0` is for a job that FREES space: the floor `[system] min_free_disk`,
+which stops all work on a full disk when the owner sets it, does not hold it.
+qex learns no disk claim, so give the growth that you saw after the first run
+(`df`). Run `qex help disk`.
+
 Give each submission a key
 --------------------------
 
@@ -493,6 +510,8 @@ A full file
     mem  = \"8GB\"
     gpu  = 2                      # devices from the pool `gpu`
     vram = \"20GB\"                 # on EACH device that this job gets
+    disk = \"6GB\"                  # a promise of disk space; \"0\" frees space
+    disk_path = \"target\"          # the filesystem of the claim; default: the cwd
 
     [resources.claims]
     net = 1                       # 1 unit of the pool `net`
@@ -510,6 +529,9 @@ a shell feature such as a pipe, name the shell:
     command = [\"bash\", \"-lc\", \"a | b > c.txt\"]
 
 `mem` accepts `8GB`, `8G`, `512MB` or a number of bytes. One unit step is 1024.
+
+`disk` accepts a size or `0`, and not the words of a budget. `disk_path` needs
+`disk`; a relative path starts in the directory of the job. Run `qex help disk`.
 
 `gpu` and `vram` claim the pool `gpu`. `vram` is the quantity on EACH device
 that the job gets, and qex does NOT add the memory of the devices together.
@@ -774,6 +796,8 @@ that qex uses now.
 
     [system]
     reserve_mem  = \"2GB\"  # memory to keep free for other programs (see mode)
+    reserve_disk = \"1GB\"  # disk to keep free after the claims of --disk jobs
+    min_free_disk = \"0\"   # start no job on a filesystem below this free space; 0 = off
     max_pressure = 20     # maximum PSI memory pressure (Linux only)
 
     [enforce]
@@ -1265,6 +1289,13 @@ the number of cores.
 
 By default a claim sets no limit on the job. See `qex help config` to make qex
 apply the claim as a limit.
+
+Disk space
+----------
+
+`--disk SIZE` claims space on a filesystem, and `--disk-path PATH` names the
+filesystem (the default is the directory of the job). The claim is a promise and
+not a limit. Run `qex help disk` for the rules.
 
 Pools: GPUs, VRAM and counted locks
 -----------------------------------
@@ -1857,6 +1888,69 @@ after a deletion. Change that time with `[history] keep` in the config file.
 `qex clean --all` deletes the record of EVERY job of this user, including the
 jobs of a different agent that shares this machine. Use `qex clean <id>` when
 another agent uses qex at the same time.
+";
+
+pub const DISK: &str = "\
+qex disk claims
+===============
+
+A job claims disk space like it claims cores and memory:
+
+    qex submit --wait --cpu 2 --mem 4GB --disk 6GB -- cargo build --release
+    qex submit --wait --disk 20GB --disk-path /var/cache/build -- ./fetch
+    qex submit --wait --disk 0 --lock nix-gc -- nix-store --gc
+
+A DISK CLAIM IS A PROMISE AND NOT A LIMIT. qex stops no job that writes more
+than it claimed. The claim decides what STARTS and when.
+
+The rules
+---------
+
+--disk SIZE        a size such as `3GB`, or `0`. The words `half` and `full` are
+                   an error, because the disk has no budget.
+--disk-path PATH   the path whose filesystem holds the claim. The default is the
+                   directory of the job. A relative path starts in the directory
+                   of the job. The path may not exist yet: the nearest directory
+                   above it that exists gives the filesystem. Two paths are one
+                   filesystem when `st_dev` is the same.
+
+A job with a claim starts when, on its filesystem,
+
+    free space  >=  reserve_disk + the claims of the jobs that operate + this claim
+
+qex reads the free space again in each pass, as a program without privilege sees
+it. A claim counts in full until the job ends, so a job that already wrote most of
+its claim counts two times, and qex errs toward waiting. Give the growth that the
+job adds, and not a margin on a margin.
+
+A job that waits has the reason `waits for disk`. The class tells who holds the
+space: the jobs of this queue (`waits-for-capacity`, the wait ends when they
+stop), other programs or the files of earlier jobs (`waits-for-machine`, the wait
+has no known end and the queue continues), or nothing can satisfy it (`parked`).
+A claim and a reserve larger than the whole filesystem is an error at the
+submission: the message says `can never start`.
+
+The configuration
+-----------------
+
+    [system]
+    reserve_disk  = \"1GB\"   # kept free after the claims; only a job with --disk
+    min_free_disk = \"0\"     # the floor: below it qex starts NO job there
+
+The floor is off by default. When an owner sets it, it holds every job on that
+filesystem, with a claim or without, except a job that claims `--disk 0`. Use
+`--disk 0` for a job that frees space, such as a garbage collection, so the
+floor does not stop the cleanup of a full disk.
+
+What qex does not do
+--------------------
+
+qex learns no disk claim, runs no cleanup command, counts the claims of its own
+queue only (not the claims of other users), and limits no job.
+
+`qex info` shows each filesystem that matters: the free space, the claims, the
+reserve and the floor. `qex status` shows the claim of a job, and `qex status
+--json` has `disk` and `disk_path`.
 ";
 
 pub const ABORT: &str = "\
