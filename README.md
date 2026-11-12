@@ -273,6 +273,13 @@ cores:           2 of 12 in use
 memory:          4GB of 24GB in use
 ```
 
+**A job can claim disk space too.** `--disk 6GB` (and `--disk-path PATH` for
+another filesystem) is a promise of the same kind: qex starts the job when the
+free space of that filesystem, less `[system] reserve_disk` and the claims of the
+jobs that operate, is at least the claim. A job with no `--disk` is not held by
+it. [Disk claims](docs/disk.md) has the rules, the floor `min_free_disk`, and
+what qex does not do.
+
 **`guess` and `half` claim one half of the budget**, so two such jobs operate
 together. `full` and `max` claim all of it, so the job operates alone. qex
 calculates the word at the submission, and the record then holds an exact value.
@@ -392,11 +399,12 @@ The full documentation is at
 | [Agents](docs/agents.md) | The page for an agent. Start here. |
 | [Sandbox](docs/sandbox.md) | What qex needs when a harness runs each command in a sandbox. |
 | [Reference](docs/reference.md) | Each command, option and configuration field. |
+| [Disk claims](docs/disk.md) | `--disk`, the reserve, the floor, and what qex does not do. |
 | [Design](docs/design.md) | The coordinator, the supervisor and the files. |
 | [Security](docs/security.md) | What qex writes, and who can read it. |
 
 Every page is also in the binary, so an agent needs no network: `qex help
-agents`, `qex help resources`, `qex help config`, `qex help events`,
+agents`, `qex help resources`, `qex help disk`, `qex help config`, `qex help events`,
 `qex schema status`.
 
 ## Completions for your shell

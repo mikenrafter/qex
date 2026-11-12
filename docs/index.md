@@ -13,7 +13,8 @@ jobs in a queue, starts each one when the machine has the cores and the memory,
 and gives you one command that waits for the result.
 
 - **A wait that always answers.** No polling, and no watch script.
-- **Cores and memory.** A local batch scheduler that knows what already operates.
+- **Cores, memory and disk.** A local batch scheduler that knows what already
+  operates, and that can hold a job until its disk claim fits ([disk claims](disk.md)).
 - **The result survives.** The coordinator can stop; your job and its result do not.
 - **Linux and macOS.** One binary, and no service to configure.
 

@@ -19611,6 +19611,10 @@ fn a_disk_claim_is_in_the_json_record_and_in_the_status_text() {
 
     let json = h.status_json(&claimed);
     assert_eq!(json["disk"], 3u64 << 20);
+    assert!(
+        h.list_json().iter().any(|r| r["disk"] == 3u64 << 20),
+        "`qex list --json` gives the full record, so it carries the claim"
+    );
     let shown = json["disk_path"].as_str().unwrap().to_string();
     assert!(
         shown.ends_with("work/out/cache") && Path::new(&shown).is_absolute(),
