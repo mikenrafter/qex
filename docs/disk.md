@@ -26,7 +26,7 @@ day, while qex kept starting jobs. A disk has no budget that qex can divide,
 because other programs write to it too. qex therefore reads the free space of
 the filesystem and compares it with the claims.
 
-This page lists the rules as claims D1 to D12. The tests name the claim that
+This page lists the rules as claims D1 to D13. The tests name the claim that
 they hold. The last section lists what qex does NOT do.
 
 ## The rules
@@ -156,6 +156,74 @@ gives the free space, the size, the claimed bytes and the number of jobs that
 hold them, the number of jobs that wait for a claim, the reserve and the floor.
 `qex info --json` has the list as `disks`. An earlier coordinator sends no list,
 and the CLI prints `unknown`, never a value that it did not measure.
+
+**D13. A wait for disk that has no known end becomes an error, after a grace.**
+A command that submits a job and waits for it (`qex submit --wait`, `qex run`,
+`qex submit --follow`) stops its wait when the job has been in the class
+`waits-for-machine` FOR DISK for 60 seconds without a break. The space is then
+held outside the queue: no job of the queue would free it, so the wait has no
+known end, and an agent that waits on would wait until its own timeout. The
+command instead
+
+1. cancels the job (it did not run, and it wrote no output),
+2. writes a message on stderr, and
+3. exits with the code **101**.
+
+*What counts.* The three causes of the class `waits-for-machine` for disk: a
+claim and its reserve that the free space does not hold, with no claim of the
+queue to release (D3, D4); a filesystem below `min_free_disk` (D8); a
+`--disk-path` that qex cannot read (D3). The coordinator writes the cause to the
+field `blocked_disk` of the record while the cause holds, and clears it when the
+cause ends. A wait of the class `waits-for-capacity` (the jobs of this queue hold
+the space) never counts, and neither does `parked` (D5), a wait for memory, a
+lock, a dependency or a pause: those are waits that have an end, or another
+remedy.
+
+*Without a break.* The clock starts when the waiting command first sees
+`blocked_disk`, and it starts again from zero each time the field goes. A job
+whose wait changes to `waits-for-capacity` and back thus has its 60 seconds
+again. The command reads the record once a second while the field is there, so
+the stop comes 60 to 62 seconds after the start of the clock.
+
+*The message* names the filesystem and the path, the free space now, what the job
+needs (the claim and the reserve, or the floor) and how much to free. It gives
+the next steps: `qex submit --wait --cpu 1 --mem 200MB --disk 0 --lock nix-gc --
+nix-store --gc` (only when `nix-store` is on the PATH), `du -xsh` on the usual
+places, a smaller `--disk`, another `--disk-path`, that a job with `--disk 0` is
+exempt (D6), and the option that waits longer.
+
+*Cancel, and not leave queued.* A job that stays in the queue starts at a moment
+that nobody chose, once the space comes back, and an agent that fixed the disk and
+submitted the job again would then run the work two times. A cancelled job also
+frees its dedupe key (`--dedupe-key`), so the second submission is a new job and
+not an answer that names the old one. The exception is a job that this command did
+not start (a dedupe key gave it): another command owns it, so this command stops
+its wait with the code 101, says so, and leaves the job in the queue.
+If the job starts in the moment before the cancel, the coordinator refuses the
+cancel, and the command waits for the job as before.
+
+*The limit.* `--disk-wait-limit TIME` sets the grace for one call: `30s`, `5m`.
+The default is `60s`. The values `0`, `none`, `never` and `unlimited` wait for ever,
+as before this claim. There is **no config key** and no environment variable: a
+qex of 0.33.0 refuses a config file with a key that it does not know (D10), so a
+key would stop every program of that version that reads the file. The option
+belongs to the call that waits, and it is not a property of the job, so it is not
+in the job file and not in `spec.json`.
+
+*Where it does not apply.* A `qex submit` with no `--wait` queues the job as
+before: a person may choose to wait. `qex wait`, `qex status --wait` and
+`qex status --follow` attach to a job that another command made, and they never
+cancel a job that they did not make, so they wait as before.
+
+*The code.* 101 is a code of the band 97 to 127 (`qex help exit-codes`). It says:
+the disk is the cause, no job ran, and the correction is on the disk.
+It is not 123 (the job gave up in the queue by its own `--max-queue-time`), not 124
+(the reader set a limit) and not 125 (something stopped a job that ran).
+
+*Compatibility (D10).* The capability `disk-wait` says that the coordinator writes
+`blocked_disk`. A coordinator without it never sets the field, so the command never
+stops its wait; the job waits as before. An explicit `--disk-wait-limit` against
+such a coordinator is refused, with the command that replaces it, as `--disk` is.
 
 ## What qex does not do
 
