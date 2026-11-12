@@ -91,8 +91,8 @@ begins with `waits for disk`.
 
 | Cause | Class (`qex info`) | What the queue does |
 | --- | --- | --- |
-| The claims of the jobs of this queue hold the space | `waits-for-capacity` | The job may keep its place at the front, as for memory. Those jobs release the space when they stop. |
-| The space is short even if every job of this queue stopped: other programs, or the files of earlier jobs, hold it | `waits-for-machine` | The queue continues behind the job. The wait has no known end, because qex does not control those programs. |
+| The jobs of this queue hold the space: their claims, or the files they wrote, would close the gap if they stopped | `waits-for-capacity` | The job may keep its place at the front, as for memory. Those jobs release the space when they stop. |
+| The space is short, and it would stay short if every job of this queue released its whole claim: other programs, or the files of earlier jobs, hold it | `waits-for-machine` | The queue continues behind the job. The wait has no known end, because qex does not control those programs. |
 | The claim and the reserve are more than the filesystem | `parked` | The job never starts. The queue continues behind it. |
 
 The disk test comes before the test of the cores and the memory, and it applies
@@ -134,6 +134,13 @@ refuses `--disk` against a coordinator that has no `disk`, with the command that
 replaces that coordinator. A job with no `--disk` needs nothing new. A CLI of
 0.33.0 works with a coordinator of this build, and a CLI of this build works with
 a coordinator of 0.33.0 for every job that has no `--disk`.
+
+**The two config keys are the exception.** qex 0.33.0 refuses a config file with a
+key that it does not know, so a file with `reserve_disk` or `min_free_disk` stops
+every command of a 0.33.0 program that reads it, and a 0.33.0 coordinator that is
+still running keeps its old values and reports the fault. Write the keys only
+after the coordinator is this build (`qex info` gives its version). The defaults
+need no key.
 
 **D11. The record carries the claim.** `spec.json` and `status.json` have the
 fields `disk` (bytes, or `null`) and `disk_path` (an absolute path, or `null`).

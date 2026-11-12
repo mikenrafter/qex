@@ -196,9 +196,26 @@ pub fn judge(
         return Judgement::Never { reason: never };
     }
 
-    // D3 and D4. The claim and the reserve must fit the free space.
+    // D3 and D4. The claim and the reserve must fit the free space, and so
+    // must the claims of the jobs that operate now.
     let own = claim.bytes.saturating_add(rules.reserve);
-    if fs.free < own {
+    let held_here = held_on(held, fs.dev, disks);
+    if fs.free >= own.saturating_add(held_here) {
+        return Judgement::Fits;
+    }
+
+    // The job waits. WHO holds the space? The free space already lacks the
+    // bytes that the jobs of this queue wrote, so a test of `free < own` alone
+    // blames programs outside the queue for a shortage that a job of the queue
+    // causes, and the reader looks for a stranger. Measured on a loop
+    // filesystem: a job that claimed 40MB and wrote 36MB left 15MB free, and
+    // the second job was told "programs outside this queue hold the space".
+    //
+    // If the free space and the claims of this queue together would hold the
+    // job, the jobs of this queue are the cause and the wait ends when they
+    // stop (`Siblings`). If not even that is enough, the space belongs to
+    // somebody else (`Outside`).
+    if held_here == 0 || fs.free.saturating_add(held_here) < own {
         return Judgement::Outside {
             reason: format!(
                 "waits for disk: the filesystem of {} has {} free, and this job claims {} with \
@@ -214,22 +231,17 @@ pub fn judge(
         };
     }
 
-    // D3. The claims of the jobs that operate now.
-    let held_here = held_on(held, fs.dev, disks);
-    if fs.free < own.saturating_add(held_here) {
-        return Judgement::Siblings {
-            fact: format!(
-                "waits for disk: this job claims {} on {}, the filesystem has {} free, the \
-                 jobs of this queue claim {} there, and {} must stay free (`reserve_disk`).",
-                show(claim.bytes),
-                claim.path.display(),
-                show(fs.free),
-                show(held_here),
-                show(rules.reserve)
-            ),
-        };
+    Judgement::Siblings {
+        fact: format!(
+            "waits for disk: this job claims {} on {}, the filesystem has {} free, the \
+             jobs of this queue claim {} there, and {} must stay free (`reserve_disk`).",
+            show(claim.bytes),
+            claim.path.display(),
+            show(fs.free),
+            show(held_here),
+            show(rules.reserve)
+        ),
     }
-    Judgement::Fits
 }
 
 /// Gives the sentence for a claim that no free space can ever satisfy, or
@@ -364,6 +376,35 @@ mod tests {
             "the fact names what the queue holds: {fact}"
         );
         assert!(fact.contains("5GB"), "the fact names the claim: {fact}");
+    }
+
+    /// CLAIM D7: a job that WROTE its claim leaves little free space, and the
+    /// next job waits for that job and not for a stranger. Measured on a loop
+    /// filesystem: a claim of 40MB, 36MB written, 15MB free; the second job was
+    /// told that programs outside the queue hold the space.
+    #[test]
+    fn a_shortage_that_a_sibling_wrote_is_a_sibling_wait() {
+        let d = Disks::fixed(vec![("/", fs(1, 15, 56))]);
+        let held = [claim(40, "/work")];
+        let c = claim(40, "/work");
+        let got = judge(rules(0, 0), Some(&c), Path::new("/work"), &held, &d);
+        assert!(
+            matches!(got, Judgement::Siblings { .. }),
+            "the held claim would cover the gap, so the queue is the cause: {got:?}"
+        );
+    }
+
+    /// CLAIM D7: when even the claims of this queue could not close the gap,
+    /// the space belongs to somebody else, whatever the queue holds.
+    #[test]
+    fn a_shortage_that_no_release_of_the_queue_can_close_is_outside() {
+        let d = Disks::fixed(vec![("/", fs(1, 5, 100))]);
+        let held = [claim(4, "/work")];
+        let c = claim(50, "/work");
+        assert!(matches!(
+            judge(rules(0, 0), Some(&c), Path::new("/work"), &held, &d),
+            Judgement::Outside { .. }
+        ));
     }
 
     /// CLAIM D3: the sum of the held claims is what counts. Two jobs of 3GB

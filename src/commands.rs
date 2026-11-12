@@ -4485,8 +4485,8 @@ pub fn queue_line(info: &Response) -> String {
             format_size(health.peer_mem),
         ),
         "waits-for-machine" => format!(
-            "queue: waits for the machine · {started}{front} · the memory belongs to a program \
-             outside this queue"
+            "queue: waits for the machine · {started}{front} · the memory or the disk space \
+             belongs to a program outside this queue"
         ),
         "waits-for-capacity" => {
             format!("queue: waits for the capacity of this queue · {started} · {counts}{front}")
