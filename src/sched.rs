@@ -294,6 +294,10 @@ pub struct Held {
     /// The quantity in use on each device. The keys are the pool name and the
     /// device index.
     pub devices: BTreeMap<String, BTreeMap<u32, u64>>,
+    /// The disk claims of the jobs that operate. The scheduler adds them up
+    /// for each filesystem, because the path of a claim names a filesystem only
+    /// after a measurement. See `disk::held_on`.
+    pub disks: Vec<crate::disk::DiskClaim>,
 }
 
 impl Held {
@@ -303,6 +307,11 @@ impl Held {
         // specification. See `size_check`.
         self.cpu += status.cpu;
         self.mem += status.mem;
+        // A record of a qex that knew no disk claim gives `None` here, and
+        // such a job holds no space (D11).
+        if let Some(claim) = status.disk_claim() {
+            self.disks.push(claim);
+        }
 
         for (name, given) in &status.assigned {
             *self.pools.entry(name.clone()).or_insert(0) += given.units;
@@ -357,6 +366,8 @@ struct Machine {
     available: u64,
     pressure: Option<f64>,
     peers: crate::peers::Claims,
+    /// The filesystems. A path gets one measurement for the whole pass.
+    disks: crate::disk::Disks,
 }
 
 impl Machine {
@@ -367,6 +378,7 @@ impl Machine {
             // This function gives an empty total when the config turns the
             // peers off, so there is no test here.
             peers: crate::peers::claims(cfg),
+            disks: crate::disk::Disks::system(),
         }
     }
 }
@@ -864,6 +876,55 @@ fn admit(
     Admit::Yes
 }
 
+/// Tests the disk claim of one job, and the floor of free space.
+///
+/// Gives `None` when the disk allows the start.
+///
+/// # The class of the wait (D7)
+///
+/// The claims of the jobs of this queue hold the space (`Sibling`): those jobs
+/// release it, so the wait has a known end, and the job may keep its place at
+/// the front. Space that something outside the queue holds (`Machine`) has no
+/// known end that qex can measure, so the queue continues behind such a job. A
+/// claim larger than the filesystem (`OversizedParked`) never starts.
+fn disk_wait(cfg: &Config, spec: &JobSpec, held: &Held, machine: &Machine) -> Option<Verdict> {
+    let claim = spec.disk_claim();
+    match crate::disk::judge(
+        cfg.disk_rules(),
+        claim.as_ref(),
+        &spec.cwd,
+        &held.disks,
+        &machine.disks,
+    ) {
+        crate::disk::Judgement::Fits => None,
+        crate::disk::Judgement::Siblings { fact } => {
+            let Admit::No {
+                blocker,
+                reason,
+                held_reason,
+            } = sibling_wait(fact, "disk space")
+            else {
+                return None;
+            };
+            Some(Verdict::Wait {
+                blocker,
+                reason,
+                held_reason,
+            })
+        }
+        crate::disk::Judgement::Outside { reason } => Some(Verdict::Wait {
+            blocker: Blocker::Machine,
+            reason,
+            held_reason: None,
+        }),
+        crate::disk::Judgement::Never { reason } => Some(Verdict::Wait {
+            blocker: Blocker::OversizedParked,
+            reason: format!("{reason} This job never starts, so qex starts the jobs behind it."),
+            held_reason: None,
+        }),
+    }
+}
+
 /// The decision for one job that has no dependency and no lock left.
 enum Verdict {
     /// The job can start now.
@@ -909,6 +970,12 @@ fn verdict(
             ),
             held_reason: None,
         };
+    }
+
+    // The disk comes before the cores and the memory, and it applies to every
+    // job that reaches the start, the oversized job also (D7).
+    if let Some(wait) = disk_wait(cfg, spec, held, machine) {
+        return wait;
     }
 
     let claims = effective_claims(spec);
@@ -2187,6 +2254,8 @@ mod tests {
             submitted_at: 0,
             dedupe_key: None,
             dedupe_window: 0,
+            disk: None,
+            disk_path: None,
         }
     }
 
@@ -3424,6 +3493,7 @@ mod tests {
                 count: 1,
                 ..Default::default()
             },
+            disks: crate::disk::Disks::system(),
         };
         assert!(matches!(
             verdict_plain(&cfg, 64, 64 << 20, 0, 0, &peer_machine, true),
@@ -3696,6 +3766,7 @@ mod tests {
             available: u64::MAX / 2,
             pressure: None,
             peers,
+            disks: crate::disk::Disks::system(),
         };
 
         let Admit::No {
@@ -3741,6 +3812,7 @@ mod tests {
             available: u64::MAX / 2,
             pressure: None,
             peers,
+            disks: crate::disk::Disks::system(),
         };
 
         let Admit::No {
@@ -4121,6 +4193,7 @@ mod tests {
             available: u64::MAX / 2,
             pressure: None,
             peers: crate::peers::Claims::default(),
+            disks: crate::disk::Disks::system(),
         };
         assert!(matches!(
             admit(
@@ -4148,6 +4221,7 @@ mod tests {
             available: u64::MAX / 2,
             pressure: None,
             peers,
+            disks: crate::disk::Disks::system(),
         };
         let Admit::No { blocker, .. } = admit(
             &cfg,
@@ -4256,5 +4330,256 @@ mod tests {
             panic!("3 of `net` must not fit while 2 of 4 are in use");
         };
         assert!(reason.contains("net"), "got: {reason}");
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+    use crate::disk::{DiskClaim, Disks};
+    use crate::sys::Fs;
+    use std::path::PathBuf;
+
+    const GB: u64 = 1 << 30;
+
+    fn fs(dev: u64, free_gb: u64, total_gb: u64) -> Fs {
+        Fs {
+            dev,
+            free: free_gb * GB,
+            total: total_gb * GB,
+        }
+    }
+
+    fn cfg(extra_system: &str) -> Config {
+        toml::from_str(&format!(
+            "[budget]\ncpu = \"8\"\nmem = \"64GB\"\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n{extra_system}\n\
+             [peers]\nenabled = false\n"
+        ))
+        .unwrap()
+    }
+
+    fn machine(cfg: &Config) -> Machine {
+        let mut m = Machine::read(cfg);
+        // `/` has 10GB free of 100GB, and `/mnt/small` has 4GB free of 8GB.
+        m.disks = Disks::fixed(vec![("/", fs(1, 10, 100)), ("/mnt/small", fs(2, 4, 8))]);
+        m
+    }
+
+    fn job(disk_gb: Option<u64>, path: &str) -> JobSpec {
+        let mut s = JobSpec::test_default();
+        s.cwd = "/work".into();
+        s.disk = disk_gb.map(|g| g * GB);
+        s.disk_path = disk_gb.map(|_| PathBuf::from(path));
+        s
+    }
+
+    fn held_claim(gb: u64, path: &str) -> Held {
+        Held {
+            disks: vec![DiskClaim {
+                bytes: gb * GB,
+                path: PathBuf::from(path),
+            }],
+            ..Held::default()
+        }
+    }
+
+    fn run(cfg: &Config, spec: &JobSpec, held: &Held, m: &Machine) -> Verdict {
+        verdict(cfg, &[], spec, spec.cpu, spec.mem, held, m, false)
+    }
+
+    /// CLAIM D3: a job with a claim that fits starts.
+    #[test]
+    fn a_claim_that_fits_starts() {
+        let c = cfg("");
+        let m = machine(&c);
+        assert!(matches!(
+            run(&c, &job(Some(5), "/work"), &Held::default(), &m),
+            Verdict::Start
+        ));
+    }
+
+    /// CLAIM D1: a job with no claim is not held by the disk, and the default
+    /// config changes nothing for it. This is the promise to every user who
+    /// never asks for a disk claim.
+    #[test]
+    fn a_job_with_no_claim_starts_on_a_full_disk_by_default() {
+        let c = cfg("");
+        let mut m = Machine::read(&c);
+        m.disks = Disks::fixed(vec![("/", fs(1, 0, 100))]);
+        assert!(matches!(
+            run(&c, &job(None, "/"), &Held::default(), &m),
+            Verdict::Start
+        ));
+    }
+
+    /// CLAIM D7: the jobs of this queue hold the space. The class is `Sibling`,
+    /// so the job may keep its place at the front, and the reason names the
+    /// disk.
+    #[test]
+    fn a_claim_that_siblings_hold_back_waits_as_a_sibling() {
+        let c = cfg("reserve_disk = \"0\"");
+        let m = machine(&c);
+        let held = held_claim(8, "/elsewhere");
+        let Verdict::Wait {
+            blocker,
+            reason,
+            held_reason,
+        } = run(&c, &job(Some(5), "/work"), &held, &m)
+        else {
+            panic!("8GB held of 10GB free leaves no room for 5GB");
+        };
+        assert_eq!(blocker, Blocker::Sibling);
+        assert!(reason.contains("waits for disk"), "{reason}");
+        assert!(reason.contains("release the disk space"), "{reason}");
+        assert!(held_reason
+            .unwrap()
+            .contains("starts no other job before this one"));
+    }
+
+    /// CLAIM D7: space that nothing in the queue holds is a `Machine` wait. The
+    /// head never keeps capacity for it, and the queue continues behind it.
+    #[test]
+    fn a_claim_that_outside_programs_hold_back_waits_as_the_machine() {
+        let c = cfg("reserve_disk = \"0\"");
+        let m = machine(&c);
+        let Verdict::Wait {
+            blocker,
+            reason,
+            held_reason,
+        } = run(&c, &job(Some(50), "/work"), &Held::default(), &m)
+        else {
+            panic!("50GB cannot fit 10GB of free space");
+        };
+        assert_eq!(blocker, Blocker::Machine);
+        assert!(reason.contains("waits for disk"), "{reason}");
+        assert!(reason.contains("no known end"), "{reason}");
+        assert!(held_reason.is_none(), "a Machine wait keeps no capacity");
+    }
+
+    /// CLAIM D7: a claim larger than its filesystem is parked, and the queue
+    /// continues behind it.
+    #[test]
+    fn a_claim_larger_than_the_filesystem_is_parked() {
+        let c = cfg("reserve_disk = \"0\"");
+        let m = machine(&c);
+        let Verdict::Wait {
+            blocker, reason, ..
+        } = run(&c, &job(Some(9), "/mnt/small/x"), &Held::default(), &m)
+        else {
+            panic!("9GB cannot fit a filesystem of 8GB");
+        };
+        assert_eq!(blocker, Blocker::OversizedParked);
+        assert!(reason.contains("never starts"), "{reason}");
+    }
+
+    /// CLAIM D2: claims on two filesystems are separate in the scheduler.
+    #[test]
+    fn claims_on_two_filesystems_are_separate() {
+        let c = cfg("reserve_disk = \"0\"");
+        let m = machine(&c);
+        let held = held_claim(4, "/mnt/small/build");
+        assert!(matches!(
+            run(&c, &job(Some(9), "/work"), &held, &m),
+            Verdict::Start
+        ));
+        assert!(matches!(
+            run(&c, &job(Some(1), "/mnt/small/other"), &held, &m),
+            Verdict::Wait {
+                blocker: Blocker::Sibling,
+                ..
+            }
+        ));
+    }
+
+    /// CLAIM D4: `reserve_disk` comes from the configuration.
+    #[test]
+    fn reserve_disk_reads_the_config() {
+        let m_cfg = cfg("reserve_disk = \"6GB\"");
+        let m = machine(&m_cfg);
+        // 10GB free, 6GB in reserve: 4GB is the most that a job can claim.
+        assert!(matches!(
+            run(&m_cfg, &job(Some(4), "/work"), &Held::default(), &m),
+            Verdict::Start
+        ));
+        assert!(matches!(
+            run(&m_cfg, &job(Some(5), "/work"), &Held::default(), &m),
+            Verdict::Wait {
+                blocker: Blocker::Machine,
+                ..
+            }
+        ));
+    }
+
+    /// CLAIM D8: the floor holds a job with no claim, and `--disk 0` passes.
+    #[test]
+    fn the_floor_holds_an_unclaimed_job_and_a_claim_of_zero_passes() {
+        let c = cfg("min_free_disk = \"5GB\"");
+        let m = machine(&c);
+        let mut small = job(None, "/mnt/small/x");
+        small.cwd = "/mnt/small/proj".into();
+        let Verdict::Wait {
+            blocker, reason, ..
+        } = run(&c, &small, &Held::default(), &m)
+        else {
+            panic!("4GB free is under a floor of 5GB");
+        };
+        assert_eq!(blocker, Blocker::Machine);
+        assert!(reason.contains("min_free_disk"), "{reason}");
+
+        small.disk = Some(0);
+        small.disk_path = Some("/mnt/small/proj".into());
+        assert!(matches!(
+            run(&c, &small, &Held::default(), &m),
+            Verdict::Start
+        ));
+    }
+
+    /// CLAIM D7: the disk test applies to the job that is larger than the
+    /// budget too. A job that qex starts alone must not start on a full disk.
+    #[test]
+    fn an_oversized_job_does_not_pass_the_disk() {
+        let c = cfg("reserve_disk = \"0\"");
+        let m = machine(&c);
+        let mut spec = job(Some(50), "/work");
+        spec.mem = 512 * GB;
+        let verdict = verdict(
+            &c,
+            &[],
+            &spec,
+            spec.cpu,
+            spec.mem,
+            &Held::default(),
+            &m,
+            true,
+        );
+        assert!(
+            matches!(
+                verdict,
+                Verdict::Wait {
+                    blocker: Blocker::Machine,
+                    ..
+                }
+            ),
+            "the disk wait comes first"
+        );
+    }
+
+    /// CLAIM D3: a record of qex 0.33.0 holds no disk claim, so a coordinator
+    /// that starts after an upgrade adds nothing for it.
+    #[test]
+    fn held_counts_the_claim_of_a_running_job_only() {
+        let mut spec = job(Some(3), "/work");
+        let mut status = crate::job::JobStatus::new(&spec);
+        status.state = JobState::Running;
+        let mut held = Held::default();
+        held.add(&status, &[]);
+        assert_eq!(held.disks.len(), 1);
+        assert_eq!(held.disks[0].bytes, 3 * GB);
+
+        spec.disk = None;
+        let mut held = Held::default();
+        held.add(&crate::job::JobStatus::new(&spec), &[]);
+        assert!(held.disks.is_empty());
     }
 }

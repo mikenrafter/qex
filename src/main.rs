@@ -45,6 +45,8 @@ mod context;
 mod daemon;
 mod deps;
 #[cfg(unix)]
+mod disk;
+#[cfg(unix)]
 mod enforce;
 #[cfg(unix)]
 mod events;

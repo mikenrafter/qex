@@ -102,6 +102,13 @@ pub struct Resources {
     pub vram: Option<String>,
     /// The claims on the other pools. The key is the pool name.
     pub claims: BTreeMap<String, ClaimEntry>,
+    /// The disk space that the job claims: a size such as `3GB`, or `0`.
+    ///
+    /// The claim is on the filesystem of `disk_path`. See `qex help disk`.
+    pub disk: Option<String>,
+    /// The path whose filesystem holds the disk claim. A relative path starts
+    /// in the directory of the job. The default is that directory.
+    pub disk_path: Option<String>,
 }
 
 /// One pool claim, as a job file gives it.
@@ -290,6 +297,11 @@ pub struct SubmitOptions {
     pub vram: Option<String>,
     /// The claims on the other pools, from `--claim NAME=N`.
     pub claims: Vec<(String, PoolClaim)>,
+    /// The disk space that the job claims, in bytes, from `--disk`. The value 0
+    /// is a decision: the job claims nothing and is exempt from the floor.
+    pub disk: Option<u64>,
+    /// The path whose filesystem holds the claim, from `--disk-path`.
+    pub disk_path: Option<PathBuf>,
     /// When true, a chosen name outside the set is accepted.
     ///
     /// Pipeline stages use this. Their names are not this rule.
@@ -375,6 +387,19 @@ pub struct JobSpec {
     /// unit after the capability test, where it is safe.
     #[serde(default)]
     pub claims: BTreeMap<String, PoolClaim>,
+    /// The disk space that this job claims, in bytes. `None` means no claim.
+    ///
+    /// The field is separate from `claims` for the reason that `locks` is: a
+    /// coordinator that has `claims` and not `disk` would take the key as a
+    /// lock of one unit and would obey a rule that nobody asked for, and a
+    /// coordinator that has neither would ignore the field in silence. The
+    /// capability `disk` gates this field. See `capabilities::required_by`.
+    #[serde(default)]
+    pub disk: Option<u64>,
+    /// The path whose filesystem holds the claim. It is absolute. It is `Some`
+    /// whenever `disk` is `Some`; the default is the directory of the job.
+    #[serde(default)]
+    pub disk_path: Option<PathBuf>,
     /// The number of times to run the job again when it fails.
     #[serde(default)]
     pub retries: u32,
@@ -453,6 +478,14 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
+    /// Gives the disk claim of this job, or `None` for a job with no claim.
+    pub fn disk_claim(&self) -> Option<crate::disk::DiskClaim> {
+        Some(crate::disk::DiskClaim {
+            bytes: self.disk?,
+            path: self.disk_path.clone().unwrap_or_else(|| self.cwd.clone()),
+        })
+    }
+
     /// Makes a complete specification.
     ///
     /// This function combines the command line options, the job file and the
@@ -906,6 +939,15 @@ impl JobSpec {
             );
         }
 
+        // The disk claim: the command line replaces the job file (D1, D2).
+        let (disk, disk_path) = resolve_disk(
+            opts.disk,
+            opts.disk_path.as_deref(),
+            file.resources.disk.as_deref(),
+            file.resources.disk_path.as_deref(),
+            &cwd,
+        )?;
+
         let mut deps = DependencyNames {
             needs: file.needs,
             after: file.after,
@@ -940,6 +982,8 @@ impl JobSpec {
                     all
                 },
                 claims,
+                disk,
+                disk_path,
                 retries: opts.retries.or(file.retries).unwrap_or(0),
                 nice,
                 dedupe_key,
@@ -953,6 +997,133 @@ impl JobSpec {
             },
             deps,
         ))
+    }
+}
+
+/// Reads a disk size: `3GB`, `512MB`, `0`.
+///
+/// This parser accepts the value 0, and the memory parser does not. A claim of
+/// no memory lets qex start any number of jobs together, and that is the fault
+/// that the claim prevents. A claim of no disk is a statement of another kind:
+/// the job writes nothing that counts, or it frees space, such as a garbage
+/// collection, and the floor of free space must not hold it (D6).
+pub fn parse_disk_size(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("half")
+        || t.eq_ignore_ascii_case("guess")
+        || t.eq_ignore_ascii_case("full")
+        || t.eq_ignore_ascii_case("max")
+    {
+        return Err(format!(
+            "incorrect --disk value `{}`. A disk claim is a size such as `3GB`, or `0`. The \
+             words `half`, `guess`, `full` and `max` divide a budget, and the disk has no \
+             budget: the free space of the filesystem changes while jobs run.",
+            crate::job::visible(s)
+        ));
+    }
+    crate::units::parse_size(t).map_err(|e| format!("--disk: {e}"))
+}
+
+/// Chooses the disk claim of a job from the command line and the job file.
+///
+/// Gives the claim in bytes, and the absolute path of the filesystem that holds
+/// it. A claim with no path gets the directory of the job (D2). A path with no
+/// claim is an error: the user asked for a rule, and qex must apply it or say
+/// that it cannot.
+fn resolve_disk(
+    cli_disk: Option<u64>,
+    cli_path: Option<&Path>,
+    file_disk: Option<&str>,
+    file_path: Option<&str>,
+    cwd: &Path,
+) -> Result<(Option<u64>, Option<PathBuf>)> {
+    let bytes = match (cli_disk, file_disk) {
+        (Some(n), _) => Some(n),
+        (None, Some(s)) => {
+            Some(parse_disk_size(s).map_err(|e| anyhow::anyhow!("[resources] disk: {e}"))?)
+        }
+        (None, None) => None,
+    };
+    let path = cli_path
+        .map(Path::to_path_buf)
+        .or_else(|| file_path.map(PathBuf::from));
+
+    let Some(bytes) = bytes else {
+        if path.is_some() {
+            bail!(
+                "--disk-path needs --disk.\n\n\
+                 The path says which filesystem holds the claim. With no claim, qex has \
+                 nothing to hold there, and the option does nothing.\n\n\
+                 Add a claim: `--disk 3GB --disk-path /var/tmp`."
+            );
+        }
+        return Ok((None, None));
+    };
+
+    // A relative path starts in the directory of the JOB, and not in the
+    // directory of the shell: `--cwd` moves the job, and the claim follows it.
+    // The coordinator operates in the root directory, so a relative path there
+    // would point to another place.
+    let path = match path {
+        Some(p) if p.is_absolute() => p,
+        Some(p) => cwd.join(p),
+        None => cwd.to_path_buf(),
+    };
+    // Remove `..` and `.` without the disk. The path may not exist yet, so
+    // `canonicalize` is not possible.
+    Ok((Some(bytes), Some(normalize(&path))))
+}
+
+/// Removes `.` and `..` from an absolute path, with no access to the disk.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+impl JobSpec {
+    /// A complete specification for a test. Every value is the plainest one.
+    pub fn test_default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            name: "t".into(),
+            cwd: "/".into(),
+            command: vec!["true".into()],
+            env: Default::default(),
+            cpu: 1,
+            mem: 1 << 20,
+            timeout: None,
+            max_queue_time: None,
+            tags: vec![],
+            priority: 0,
+            env_capture: EnvCapture::None,
+            claim_source: "explicit".into(),
+            cpu_source: "explicit".into(),
+            mem_source: "explicit".into(),
+            group: None,
+            group_name: None,
+            needs: vec![],
+            after: vec![],
+            locks: vec![],
+            claims: Default::default(),
+            disk: None,
+            disk_path: None,
+            retries: 0,
+            nice: None,
+            dedupe_key: None,
+            dedupe_window: 0,
+            learn_key: None,
+            submitted_at: 0,
+        }
     }
 }
 
@@ -2613,5 +2784,177 @@ mod tests {
         );
         assert!(parse_env_pair("noequals").is_err());
         assert!(parse_env_pair("=novalue").is_err());
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.learn.enabled = false;
+        cfg
+    }
+
+    fn base(dir: &Path) -> SubmitOptions {
+        SubmitOptions {
+            command: vec!["true".into()],
+            cwd: Some(dir.to_path_buf()),
+            ..SubmitOptions::default()
+        }
+    }
+
+    fn resolve_in(dir: &Path, f: impl FnOnce(&mut SubmitOptions)) -> Result<JobSpec> {
+        let mut o = base(dir);
+        f(&mut o);
+        JobSpec::resolve(&o, &cfg())
+    }
+
+    /// CLAIM D1: a job with no `--disk` has no disk claim. Nothing changes for
+    /// a user who never asks.
+    #[test]
+    fn a_job_without_a_flag_has_no_disk_claim() {
+        let dir = std::env::temp_dir();
+        let spec = resolve_in(&dir, |_| {}).unwrap();
+        assert_eq!(spec.disk, None);
+        assert_eq!(spec.disk_path, None);
+        assert!(spec.disk_claim().is_none());
+    }
+
+    /// CLAIM D1 and D2: the claim is in bytes, and the path defaults to the
+    /// directory of the job.
+    #[test]
+    fn a_claim_with_no_path_takes_the_directory_of_the_job() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let spec = resolve_in(&dir, |o| o.disk = Some(3 << 30)).unwrap();
+        assert_eq!(spec.disk, Some(3 << 30));
+        assert_eq!(spec.disk_path.as_deref(), Some(dir.as_path()));
+        let claim = spec.disk_claim().unwrap();
+        assert_eq!(
+            (claim.bytes, claim.path.as_path()),
+            (3 << 30, dir.as_path())
+        );
+    }
+
+    /// CLAIM D2: an absolute path stays, and a relative path starts in the
+    /// directory of the JOB, not in the directory of the shell.
+    #[test]
+    fn a_relative_path_starts_in_the_directory_of_the_job() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let spec = resolve_in(&dir, |o| {
+            o.disk = Some(1);
+            o.disk_path = Some("target/debug".into());
+        })
+        .unwrap();
+        assert_eq!(spec.disk_path.unwrap(), dir.join("target/debug"));
+
+        let spec = resolve_in(&dir, |o| {
+            o.disk = Some(1);
+            o.disk_path = Some("/var/tmp".into());
+        })
+        .unwrap();
+        assert_eq!(spec.disk_path.unwrap(), Path::new("/var/tmp"));
+    }
+
+    /// CLAIM D2: `..` and `.` leave the path, with no access to the disk. The
+    /// path may not exist yet.
+    #[test]
+    fn dots_leave_the_path_and_the_path_need_not_exist() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let spec = resolve_in(&dir, |o| {
+            o.disk = Some(1);
+            o.disk_path = Some("a/./b/../c".into());
+        })
+        .unwrap();
+        assert_eq!(spec.disk_path.unwrap(), dir.join("a/c"));
+    }
+
+    /// CLAIM D1: a path with no claim is an error that names both options.
+    #[test]
+    fn a_path_without_a_claim_is_an_error() {
+        let dir = std::env::temp_dir();
+        let err = resolve_in(&dir, |o| o.disk_path = Some("/var/tmp".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--disk-path needs --disk"), "{err}");
+    }
+
+    /// CLAIM D6: the value 0 is a claim, and the memory parser refuses it.
+    #[test]
+    fn zero_is_a_disk_claim() {
+        assert_eq!(parse_disk_size("0"), Ok(0));
+        assert_eq!(parse_disk_size("0GB"), Ok(0));
+        let dir = std::env::temp_dir();
+        let spec = resolve_in(&dir, |o| o.disk = Some(0)).unwrap();
+        assert_eq!(spec.disk, Some(0));
+        assert!(spec.disk_path.is_some(), "a claim of 0 still has a path");
+    }
+
+    /// CLAIM D1: the words of the budget are an error with a reason, and not a
+    /// guess. The disk has no budget.
+    #[test]
+    fn the_words_of_the_budget_are_refused_for_the_disk() {
+        for word in ["half", "guess", "full", "max", "FULL"] {
+            let err = parse_disk_size(word).unwrap_err();
+            assert!(err.contains("no budget"), "{word}: {err}");
+        }
+        assert_eq!(parse_disk_size("3GB"), Ok(3 << 30));
+        assert_eq!(parse_disk_size("512MB"), Ok(512 << 20));
+        assert!(parse_disk_size("-1GB").is_err());
+        assert!(parse_disk_size("lots").is_err());
+    }
+
+    /// CLAIM D9: the job file and the pipeline stage take the claim, and the
+    /// command line replaces the file.
+    #[test]
+    fn the_job_file_takes_a_disk_claim_and_the_command_line_replaces_it() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let file: JobFile = toml::from_str(
+            "command = [\"true\"]\n[resources]\ndisk = \"2GB\"\ndisk_path = \"/var/tmp\"\n",
+        )
+        .unwrap();
+        let mut o = SubmitOptions {
+            cwd: Some(dir.clone()),
+            ..SubmitOptions::default()
+        };
+        let (spec, _) = JobSpec::resolve_from_file(&o, &cfg(), file.clone()).unwrap();
+        assert_eq!(spec.disk, Some(2 << 30));
+        assert_eq!(spec.disk_path.unwrap(), Path::new("/var/tmp"));
+
+        o.disk = Some(5 << 30);
+        o.disk_path = Some("/mnt/x".into());
+        let (spec, _) = JobSpec::resolve_from_file(&o, &cfg(), file).unwrap();
+        assert_eq!(spec.disk, Some(5 << 30));
+        assert_eq!(spec.disk_path.unwrap(), Path::new("/mnt/x"));
+    }
+
+    /// CLAIM D9: a bad size in the job file names the field.
+    #[test]
+    fn a_bad_size_in_the_job_file_names_the_field() {
+        let dir = std::env::temp_dir();
+        let file: JobFile =
+            toml::from_str("command = [\"true\"]\n[resources]\ndisk = \"full\"\n").unwrap();
+        let o = SubmitOptions {
+            cwd: Some(dir),
+            ..SubmitOptions::default()
+        };
+        let err = JobSpec::resolve_from_file(&o, &cfg(), file)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[resources] disk"), "{err}");
+    }
+
+    /// CLAIM D11: a specification that an earlier qex wrote has no disk
+    /// fields, and it reads as a job with no claim.
+    #[test]
+    fn a_specification_of_an_earlier_qex_reads_without_a_claim() {
+        let mut value = serde_json::to_value(JobSpec::test_default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("disk");
+        object.remove("disk_path");
+        let spec: JobSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(spec.disk, None);
+        assert!(spec.disk_claim().is_none());
     }
 }

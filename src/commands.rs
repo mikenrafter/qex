@@ -176,6 +176,8 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         gpu: args.gpu,
         vram: args.vram,
         claims: args.claims,
+        disk: args.disk,
+        disk_path: args.disk_path,
         allow_unsafe_name: false,
     };
 
@@ -506,6 +508,8 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
         gpu: args.gpu,
         vram: args.vram,
         claims: args.claims,
+        disk: args.disk,
+        disk_path: args.disk_path,
         nice: args.nice,
         no_limit_env_hints: args.no_limit_env_hints,
         // A fan-out refuses these options above, so no job of it holds a key.
@@ -4537,6 +4541,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             paused_locks,
             health,
             pools,
+            disks,
         } => {
             let picture = PausePicture::from_info(
                 queue_state.as_deref(),
@@ -4586,6 +4591,8 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                         // `null` says that this coordinator cannot answer. It
                         // does not say that the machine has no pool.
                         "pools": pools,
+                        // `null` says that this coordinator cannot answer.
+                        "disks": disks,
                     }))?
                 );
                 return Ok(0);
@@ -5964,6 +5971,8 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         gpu: args.submit.gpu,
         vram: args.submit.vram,
         claims: args.submit.claims,
+        disk: args.submit.disk,
+        disk_path: args.submit.disk_path,
         allow_unsafe_name: false,
     };
 
@@ -7132,6 +7141,8 @@ mod tests {
             finished_at: Some(1),
             cpu: 1,
             mem: 1 << 30,
+            disk: None,
+            disk_path: None,
             claim_source: "explicit".into(),
             cpu_source: "explicit".into(),
             mem_source: "explicit".into(),

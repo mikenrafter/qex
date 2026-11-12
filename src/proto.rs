@@ -578,6 +578,14 @@ pub enum Response {
         /// pool", which is a different statement and can be a lie.
         #[serde(default)]
         pools: Option<Vec<PoolReport>>,
+        /// The filesystems that matter to the queue now, and their free space.
+        ///
+        /// THIS FIELD IS AN OPTION, AND NOT A DEFAULTED LIST, for the reason
+        /// that `pools` is: `None` means "this coordinator cannot say", and
+        /// `qex info` writes `unknown`. An empty list would say that no
+        /// filesystem matters, and an earlier coordinator did not say that.
+        #[serde(default)]
+        disks: Option<Vec<DiskReport>>,
     },
     /// The things that the coordinator can do.
     Capabilities { names: Vec<String> },
@@ -659,6 +667,28 @@ pub struct PoolReport {
     /// The devices of an indexed pool. The list is empty for a plain pool.
     #[serde(default)]
     pub devices: Vec<DeviceReport>,
+}
+
+/// One filesystem, as `qex info` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskReport {
+    /// A path on the filesystem: the path of a claim, or the directory that
+    /// holds the records of qex.
+    pub path: String,
+    /// The bytes that a program without privilege can still write.
+    pub free: u64,
+    /// The size of the filesystem.
+    pub total: u64,
+    /// The bytes that the jobs which operate now claim on this filesystem.
+    pub claimed: u64,
+    /// The number of jobs that operate now with a claim here.
+    pub holders: usize,
+    /// The number of jobs in the queue that claim space here.
+    pub waiting: usize,
+    /// `[system] reserve_disk`.
+    pub reserve: u64,
+    /// `[system] min_free_disk`. 0 means no floor.
+    pub floor: u64,
 }
 
 /// One device of an indexed pool.
@@ -788,6 +818,8 @@ mod tests {
             after: vec![],
             dedupe_key: None,
             dedupe_window: 0,
+            disk: None,
+            disk_path: None,
             learn_key: None,
             submitted_at: 0,
         };

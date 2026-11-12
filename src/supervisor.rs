@@ -1890,6 +1890,8 @@ mod tests {
             submitted_at: 0,
             dedupe_key: None,
             dedupe_window: 0,
+            disk: None,
+            disk_path: None,
         }
     }
 

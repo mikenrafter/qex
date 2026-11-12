@@ -716,6 +716,8 @@ mod tests {
             max_queue_time: None,
             dedupe_key: None,
             dedupe_window: 0,
+            disk: None,
+            disk_path: None,
             learn_key: None,
             needs: vec![],
             after: vec![],

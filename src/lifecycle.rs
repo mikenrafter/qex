@@ -769,6 +769,8 @@ mod tests {
             after: vec![],
             dedupe_key: None,
             dedupe_window: 0,
+            disk: None,
+            disk_path: None,
             learn_key: None,
             submitted_at: 0,
         };

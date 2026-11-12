@@ -283,6 +283,8 @@ mod tests {
             submitted_at: crate::sys::now_secs(),
             dedupe_key: None,
             dedupe_window: 0,
+            disk: None,
+            disk_path: None,
         }
     }
 

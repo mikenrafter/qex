@@ -184,6 +184,7 @@ pub const ALL: &[&str] = &[
     "abort",
     "dedupe",
     "dependencies",
+    "disk",
     "events",
     "groups",
     "history",
@@ -266,6 +267,12 @@ pub fn required_by(spec: &JobSpec) -> Vec<&'static str> {
     if spec.dedupe_key.is_some() {
         out.push("dedupe");
     }
+    // A coordinator that does not know `disk` keeps the field, gives a job id,
+    // and starts the job when the cores and the memory fit. The user asked for
+    // a rule that protects the disk, and the disk can fill with no sign.
+    if spec.disk.is_some() {
+        out.push("disk");
+    }
     out
 }
 
@@ -284,6 +291,7 @@ pub fn option_for(capability: &'static str) -> &'static str {
         "groups" => "qex pipeline",
         "politeness" => "--nice",
         "dedupe" => "--dedupe-key",
+        "disk" => "--disk",
         // A capability that no option names keeps its own name. Every
         // capability that a JOB asks for has an option above. A name that
         // reaches this arm gates a COMMAND, and `check_command` names the
@@ -513,6 +521,8 @@ mod tests {
             after: vec![],
             dedupe_key: None,
             dedupe_window: 0,
+            disk: None,
+            disk_path: None,
             submitted_at: 0,
         }
     }
@@ -1135,5 +1145,82 @@ mod tests {
         let now: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
         let stages = [stage("one", &[]), stage("two", &["locks"])];
         assert!(check_pipeline(&now, env!("CARGO_PKG_VERSION"), 1, &[], &stages).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    fn with_disk(bytes: u64) -> JobSpec {
+        let mut s = crate::spec::JobSpec::test_default();
+        s.disk = Some(bytes);
+        s.disk_path = Some("/".into());
+        s
+    }
+
+    /// CLAIM D10: a coordinator that does not know `disk` ignores the field in
+    /// silence and gives a job id. The CLI must refuse the job and name the
+    /// option.
+    #[test]
+    fn a_disk_claim_is_refused_by_a_coordinator_that_has_no_disk_claims() {
+        let s = with_disk(3 << 30);
+        assert_eq!(required_by(&s), vec!["disk"]);
+
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "disk")
+            .map(|c| c.to_string())
+            .collect();
+        let err = check(&old, "0.33.0", 4321, &s).unwrap_err();
+        assert!(
+            err.contains("--disk"),
+            "the message names the option: {err}"
+        );
+        assert!(
+            err.contains("kill 4321"),
+            "the message gives the remedy: {err}"
+        );
+    }
+
+    /// CLAIM D10: a coordinator of this build obeys the claim.
+    #[test]
+    fn this_build_obeys_a_disk_claim() {
+        let all: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(check(&all, "0.34.0", 1, &with_disk(1)).is_ok());
+    }
+
+    /// CLAIM D10 and D6: a claim of 0 is still a claim. An earlier coordinator
+    /// would run the job, and the user wanted the exemption from the floor,
+    /// which that coordinator does not have either. Refuse it as well.
+    #[test]
+    fn a_claim_of_zero_needs_the_capability_too() {
+        assert_eq!(required_by(&with_disk(0)), vec!["disk"]);
+    }
+
+    /// CLAIM D10: a job with no disk claim needs nothing new. A CLI of this
+    /// build must still submit to a coordinator of 0.33.0.
+    #[test]
+    fn a_job_without_a_disk_claim_passes_an_earlier_coordinator() {
+        let mut s = crate::spec::JobSpec::test_default();
+        s.disk = None;
+        assert!(required_by(&s).is_empty());
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "disk")
+            .map(|c| c.to_string())
+            .collect();
+        assert!(check(&old, "0.33.0", 1, &s).is_ok());
+    }
+
+    /// The option table has the option, and the list of capabilities is sorted
+    /// as the other names are.
+    #[test]
+    fn the_capability_has_an_option_and_a_place_in_the_list() {
+        assert_eq!(option_for("disk"), "--disk");
+        assert!(ALL.contains(&"disk"));
+        let mut sorted = ALL.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, ALL.to_vec(), "ALL is sorted");
     }
 }

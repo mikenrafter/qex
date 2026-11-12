@@ -516,6 +516,16 @@ pub struct JobStatus {
     pub cpu: u64,
     /// The memory claim of the job, in bytes.
     pub mem: u64,
+    /// The disk space that the job claims, in bytes. `None` means that the job
+    /// claims none. The value 0 means that the job claimed nothing on purpose.
+    ///
+    /// The claim is a promise and not a limit: qex stops no job that writes
+    /// more. See `qex help disk`.
+    #[serde(default)]
+    pub disk: Option<u64>,
+    /// The path whose filesystem holds the disk claim. It is absolute.
+    #[serde(default)]
+    pub disk_path: Option<String>,
     /// Where the claim came from: `explicit`, `learned` or `default`.
     ///
     /// A reader can then see that a claim came from a measurement, and that it
@@ -660,6 +670,21 @@ impl JobStatus {
         safe_name(&self.name)
     }
 
+    /// Gives the disk claim of this job, or `None` for a job with no claim.
+    ///
+    /// A record of a qex that knew no disk claim gives `None`, and such a job
+    /// holds no space (D11).
+    pub fn disk_claim(&self) -> Option<crate::disk::DiskClaim> {
+        Some(crate::disk::DiskClaim {
+            bytes: self.disk?,
+            path: self
+                .disk_path
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(&self.cwd)),
+        })
+    }
+
     pub fn new(spec: &JobSpec) -> Self {
         Self {
             id: spec.id,
@@ -686,6 +711,11 @@ impl JobStatus {
             finished_at: None,
             cpu: spec.cpu,
             mem: spec.mem,
+            disk: spec.disk,
+            disk_path: spec
+                .disk
+                .and(spec.disk_path.as_ref())
+                .map(|p| p.to_string_lossy().into_owned()),
             claim_source: spec.claim_source.clone(),
             cpu_source: spec.cpu_source.clone(),
             mem_source: spec.mem_source.clone(),
@@ -1039,5 +1069,66 @@ mod tests {
         assert!(leftovers.is_empty(), "atomic write left temp files behind");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    /// CLAIM D1 and D11: the record carries the claim and its absolute path.
+    #[test]
+    fn the_record_carries_the_claim() {
+        let mut spec = crate::spec::JobSpec::test_default();
+        spec.disk = Some(3 << 30);
+        spec.disk_path = Some("/var/tmp".into());
+        let status = JobStatus::new(&spec);
+        assert_eq!(status.disk, Some(3 << 30));
+        assert_eq!(status.disk_path.as_deref(), Some("/var/tmp"));
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["disk"], 3u64 << 30);
+        assert_eq!(json["disk_path"], "/var/tmp");
+        let claim = status.disk_claim().unwrap();
+        assert_eq!(claim.bytes, 3 << 30);
+    }
+
+    /// CLAIM D11: a job with no claim writes `null`, and reads back as no
+    /// claim.
+    #[test]
+    fn a_job_without_a_claim_writes_null() {
+        let status = JobStatus::new(&crate::spec::JobSpec::test_default());
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json["disk"].is_null() && json["disk_path"].is_null());
+        assert!(status.disk_claim().is_none());
+    }
+
+    /// CLAIM D11: a record that qex 0.33.0 wrote has no disk field. It reads
+    /// as a job with no claim, and the coordinator that starts after an upgrade
+    /// counts it as a job that holds no space.
+    #[test]
+    fn a_record_of_qex_0_33_0_reads_without_a_claim() {
+        let status = JobStatus::new(&crate::spec::JobSpec::test_default());
+        let mut json = serde_json::to_value(&status).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("disk");
+        object.remove("disk_path");
+        let back: JobStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back.disk, None);
+        assert!(back.disk_claim().is_none());
+    }
+
+    /// A claim with no stored path falls back to the directory of the job, so
+    /// a record that lost the path still names a filesystem.
+    #[test]
+    fn a_claim_with_no_path_takes_the_directory_of_the_record() {
+        let mut spec = crate::spec::JobSpec::test_default();
+        spec.cwd = "/srv/build".into();
+        let mut status = JobStatus::new(&spec);
+        status.disk = Some(1);
+        status.disk_path = None;
+        assert_eq!(
+            status.disk_claim().unwrap().path,
+            std::path::PathBuf::from("/srv/build")
+        );
     }
 }

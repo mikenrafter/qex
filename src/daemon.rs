@@ -2493,6 +2493,8 @@ fn handle_info(coord: &Arc<Coordinator>, peer: Option<i32>) -> Response {
 
     let earlier = crate::pause::for_an_earlier_cli(&state.paused.queue);
     Response::Info {
+        // STUB: the red tests of the first commit fail against this line.
+        disks: None,
         pools: Some(pools),
         pid: std::process::id() as i32,
         version: crate::version::VERSION.to_string(),
@@ -3289,6 +3291,8 @@ mod tests {
             after: vec![],
             dedupe_key: Some(key.to_string()),
             dedupe_window: 0,
+            disk: None,
+            disk_path: None,
             learn_key: None,
             submitted_at: 0,
         }

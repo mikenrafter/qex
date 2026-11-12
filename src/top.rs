@@ -1484,6 +1484,8 @@ mod tests {
             finished_at: None,
             cpu,
             mem,
+            disk: None,
+            disk_path: None,
             claim_source: "explicit".into(),
             cpu_source: "explicit".into(),
             mem_source: "explicit".into(),
@@ -1515,6 +1517,7 @@ mod tests {
         Response::Info {
             config_error: None,
             pools: None,
+            disks: None,
             pid: 1,
             version: "test".into(),
             started_at: 0,
@@ -1568,6 +1571,7 @@ mod tests {
         };
         let paused = Response::Info {
             pools: None,
+            disks: None,
             pid,
             version,
             started_at,
@@ -1810,6 +1814,7 @@ mod tests {
             paused_locks,
             health,
             pools,
+            disks: None,
         }
     }
 

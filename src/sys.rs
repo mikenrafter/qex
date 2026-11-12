@@ -42,6 +42,58 @@ pub fn available_memory() -> u64 {
     vm_available().unwrap_or_else(total_memory)
 }
 
+/// What one filesystem holds, and what is free on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fs {
+    /// The device number (`st_dev`) that names the filesystem. Two paths on one
+    /// filesystem give one number, whatever their names are.
+    pub dev: u64,
+    /// The bytes that a program without privilege can still write. The system
+    /// keeps a part of each filesystem for the superuser, and this number does
+    /// not include that part.
+    pub free: u64,
+    /// The size of the filesystem in bytes.
+    pub total: u64,
+}
+
+/// Reads the filesystem that holds a path.
+///
+/// A path that does not exist yet is common: a build writes to `target/` and
+/// the directory is not there before the build. The nearest directory above it
+/// that exists gives the answer, because the new directory will be on the same
+/// filesystem, except for a mount point that appears later. The result is
+/// `None` when no directory above the path can be read.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // the field types differ between systems
+pub fn filesystem(path: &std::path::Path) -> Option<Fs> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut at = path;
+    let meta = loop {
+        match std::fs::metadata(at) {
+            Ok(m) => break m,
+            Err(_) => at = at.parent()?,
+        }
+    };
+    let c = std::ffi::CString::new(at.as_os_str().as_bytes()).ok()?;
+    let mut raw: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut raw) } != 0 {
+        return None;
+    }
+    // `f_frsize` is the unit of the block counts. Some systems report 0 there.
+    let unit = if raw.f_frsize > 0 {
+        raw.f_frsize as u64
+    } else {
+        raw.f_bsize as u64
+    };
+    Some(Fs {
+        dev: meta.dev(),
+        free: (raw.f_bavail as u64).saturating_mul(unit),
+        total: (raw.f_blocks as u64).saturating_mul(unit),
+    })
+}
+
 /// Gives the memory pressure as a value from 0 to 100.
 ///
 /// The result is `None` if the platform does not supply this measurement.

@@ -199,6 +199,23 @@ pub struct SubmitArgs {
     #[arg(long = "claim", value_name = "NAME=N", value_parser = crate::spec::parse_claim_pair)]
     pub claims: Vec<(String, crate::spec::PoolClaim)>,
 
+    /// Claim SIZE of disk space on the filesystem of --disk-path.
+    ///
+    /// The claim is a promise and not a limit: qex stops no job that writes
+    /// more. qex starts the job when the free space of the filesystem, less
+    /// `[system] reserve_disk` and the claims of the jobs that operate, is at
+    /// least SIZE. Give `0` for a job that writes nothing that counts or that
+    /// frees space, such as a garbage collection. Run `qex help disk`.
+    #[arg(long, value_name = "SIZE", value_parser = crate::spec::parse_disk_size)]
+    pub disk: Option<u64>,
+
+    /// The path whose filesystem holds the --disk claim.
+    ///
+    /// The default is the directory of the job. The path may not exist yet: the
+    /// nearest directory above it that exists gives the filesystem.
+    #[arg(long, value_name = "PATH")]
+    pub disk_path: Option<PathBuf>,
+
     /// A name for the job, to show in `qex list`.
     ///
     /// Letters, numbers, `-`, `_` and `.` only. It must not start with `-`.
@@ -1395,5 +1412,61 @@ mod tests {
             .unwrap()
             .matches(JobState::Queued));
         assert!(StateFilter::parse("nonsense").is_err());
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    fn submit(args: &[&str]) -> Result<SubmitArgs, String> {
+        let mut all = vec!["qex", "submit"];
+        all.extend_from_slice(args);
+        all.extend_from_slice(&["--", "true"]);
+        match Cli::try_parse_from(all) {
+            Ok(Cli {
+                command: Some(Command::Submit(a)),
+                ..
+            }) => Ok(a),
+            Ok(_) => panic!("not a submit"),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// CLAIM D1: `--disk` and `--disk-path` parse on `submit`.
+    #[test]
+    fn disk_and_disk_path_parse() {
+        let a = submit(&["--disk", "3GB", "--disk-path", "/var/tmp"]).unwrap();
+        assert_eq!(a.disk, Some(3 << 30));
+        assert_eq!(
+            a.disk_path.as_deref(),
+            Some(std::path::Path::new("/var/tmp"))
+        );
+        let a = submit(&[]).unwrap();
+        assert_eq!((a.disk, a.disk_path), (None, None));
+    }
+
+    /// CLAIM D6: `--disk 0` parses, and `--mem 0` does not.
+    #[test]
+    fn disk_zero_parses() {
+        assert_eq!(submit(&["--disk", "0"]).unwrap().disk, Some(0));
+        assert!(submit(&["--mem", "0"]).is_err());
+    }
+
+    /// CLAIM D1: the words of a budget are refused, with the reason.
+    #[test]
+    fn disk_refuses_the_words_of_a_budget() {
+        let err = submit(&["--disk", "guess"]).unwrap_err();
+        assert!(err.contains("no budget"), "{err}");
+    }
+
+    /// `qex run` takes the options too, because it is `submit --follow`.
+    #[test]
+    fn run_takes_the_disk_options() {
+        let cli = Cli::try_parse_from(["qex", "run", "--disk", "1GB", "--", "true"]).unwrap();
+        let Some(Command::Run(r)) = cli.command else {
+            panic!("not a run");
+        };
+        assert_eq!(r.submit.disk, Some(1 << 30));
     }
 }

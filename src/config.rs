@@ -415,6 +415,22 @@ pub struct SystemConfig {
     /// that qex does not control.
     #[serde(deserialize_with = "text_or_number")]
     pub reserve_mem: String,
+    /// The quantity of disk space to keep free after the claims of the jobs.
+    ///
+    /// qex does not start a job with `--disk` if the claim would leave less
+    /// than this on the filesystem of the claim. The value applies to a job
+    /// that claims disk space; a job with no claim is not held by it. See
+    /// `min_free_disk` for the test that holds every job.
+    #[serde(deserialize_with = "text_or_number")]
+    pub reserve_disk: String,
+    /// The free space below which qex starts no job on a filesystem.
+    ///
+    /// The test holds a job with no disk claim as well, on the filesystem of
+    /// the directory of the job. A job that claims `--disk 0` is exempt, so a
+    /// garbage collection can still run when the disk is full. The value 0
+    /// turns the test off, and it is the default.
+    #[serde(deserialize_with = "text_or_number")]
+    pub min_free_disk: String,
     /// The maximum permitted memory pressure.
     ///
     /// qex does not start a job while the PSI value is above this limit.
@@ -428,6 +444,8 @@ impl Default for SystemConfig {
         Self {
             // EMPTY means "choose from `[enforce] mode`". See `reserve_mem`.
             reserve_mem: String::new(),
+            reserve_disk: "1GB".to_string(),
+            min_free_disk: "0".to_string(),
             max_pressure: 20.0,
         }
     }
@@ -1451,6 +1469,26 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("config [system] reserve_mem: {e}"))
     }
 
+    /// Gives the disk space that qex keeps free after the claims of the jobs.
+    pub fn reserve_disk(&self) -> Result<u64> {
+        units::parse_size(&self.system.reserve_disk)
+            .map_err(|e| anyhow::anyhow!("config [system] reserve_disk: {e}"))
+    }
+
+    /// Gives the free space below which qex starts no job. 0 means no floor.
+    pub fn min_free_disk(&self) -> Result<u64> {
+        units::parse_size(&self.system.min_free_disk)
+            .map_err(|e| anyhow::anyhow!("config [system] min_free_disk: {e}"))
+    }
+
+    /// Gives the two disk numbers in the form that the scheduler reads.
+    pub fn disk_rules(&self) -> crate::disk::Rules {
+        crate::disk::Rules {
+            reserve: self.reserve_disk().unwrap_or(1 << 30),
+            floor: self.min_free_disk().unwrap_or(0),
+        }
+    }
+
     pub fn settle(&self) -> Result<std::time::Duration> {
         units::parse_duration(&self.queue.settle)
             .map_err(|e| anyhow::anyhow!("config [queue] settle: {e}"))
@@ -1774,6 +1812,8 @@ impl Config {
         self.budget_cpu()?;
         self.budget_mem()?;
         self.reserve_mem()?;
+        self.reserve_disk()?;
+        self.min_free_disk()?;
         self.settle()?;
         self.peer_stale_after()?;
         self.history_keep()?;
@@ -2551,6 +2591,8 @@ mem = "20GB"
 
 [system]
 reserve_mem = "2GB"
+reserve_disk = "1GB"
+min_free_disk = "0"
 max_pressure = 20
 
 [enforce]
@@ -2858,5 +2900,57 @@ count = 4
         );
         assert_eq!(EnvCapture::from_str(" none ").unwrap(), EnvCapture::None);
         assert!(EnvCapture::from_str("some").is_err());
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    /// CLAIM D4: the default reserve is 1GB, and it changes nothing for a job
+    /// that claims no disk (D8, D1).
+    #[test]
+    fn the_defaults_keep_1gb_and_set_no_floor() {
+        let c = Config::default();
+        assert_eq!(c.reserve_disk().unwrap(), 1 << 30);
+        assert_eq!(c.min_free_disk().unwrap(), 0);
+        let rules = c.disk_rules();
+        assert_eq!((rules.reserve, rules.floor), (1 << 30, 0));
+    }
+
+    /// CLAIM D4 and D8: both keys take a size, and a number is a number of
+    /// bytes, as `reserve_mem` does.
+    #[test]
+    fn both_keys_take_a_size_or_a_number() {
+        let c: Config =
+            toml::from_str("[system]\nreserve_disk = \"4GB\"\nmin_free_disk = \"512MB\"\n")
+                .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.reserve_disk().unwrap(), 4 << 30);
+        assert_eq!(c.min_free_disk().unwrap(), 512 << 20);
+
+        let c: Config = toml::from_str("[system]\nreserve_disk = 0\nmin_free_disk = 0\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.reserve_disk().unwrap(), 0);
+    }
+
+    /// A value that is not a size is an error that names the key.
+    #[test]
+    fn a_bad_value_names_the_key() {
+        let c: Config = toml::from_str("[system]\nreserve_disk = \"plenty\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("reserve_disk"), "{err}");
+        let c: Config = toml::from_str("[system]\nmin_free_disk = \"lots\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("min_free_disk"), "{err}");
+    }
+
+    /// `qex config show --json` gives the value in force, and the keys are
+    /// there.
+    #[test]
+    fn the_resolved_config_holds_both_keys() {
+        let json = serde_json::to_value(Config::default().resolved()).unwrap();
+        assert_eq!(json["system"]["reserve_disk"], "1GB");
+        assert_eq!(json["system"]["min_free_disk"], "0");
     }
 }

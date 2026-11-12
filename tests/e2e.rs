@@ -19537,3 +19537,430 @@ fn a_cancel_of_many_ids_gives_a_line_for_each() {
         "a kill of one job that waits names the command that fits"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Disk claims. Read `docs/disk.md` for the claims D1 to D12 that these tests
+// name.
+// ---------------------------------------------------------------------------
+
+/// The free and the total bytes of the filesystem that holds a path.
+fn disk_of(path: &Path) -> (u64, u64, u64) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut raw: libc::statvfs = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::statvfs(c.as_ptr(), &mut raw) }, 0);
+    let unit = if raw.f_frsize > 0 {
+        raw.f_frsize as u64
+    } else {
+        raw.f_bsize as u64
+    };
+    (
+        std::fs::metadata(path).unwrap().dev(),
+        raw.f_bavail as u64 * unit,
+        raw.f_blocks as u64 * unit,
+    )
+}
+
+/// A harness whose config sets the two disk keys. The reserve of memory is 0,
+/// as in the other tests, so only the disk decides.
+fn disk_harness(name: &str, reserve_disk: &str, min_free_disk: &str) -> Harness {
+    Harness::new(
+        name,
+        &format!(
+            "[peers]\nenabled = false\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+             reserve_disk = \"{reserve_disk}\"\nmin_free_disk = \"{min_free_disk}\"\n"
+        ),
+    )
+}
+
+fn bytes_arg(n: u64) -> String {
+    format!("{n}B")
+}
+
+/// CLAIM D1 and D11: the record carries the claim, and a job with no claim
+/// carries `null`.
+#[test]
+fn a_disk_claim_is_in_the_json_record_and_in_the_status_text() {
+    let h = disk_harness("diskrec", "0", "0");
+    let dir = h.root.join("work");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let claimed = h.submit(&[
+        "submit",
+        "--disk",
+        "3MB",
+        "--disk-path",
+        "out/./cache",
+        "--cwd",
+        dir.to_str().unwrap(),
+        "--",
+        "true",
+    ]);
+    let plain = h.submit(&["submit", "--cwd", dir.to_str().unwrap(), "--", "true"]);
+    let default_path = h.submit(&[
+        "submit",
+        "--disk",
+        "1MB",
+        "--cwd",
+        dir.to_str().unwrap(),
+        "--",
+        "true",
+    ]);
+
+    let json = h.status_json(&claimed);
+    assert_eq!(json["disk"], 3u64 << 20);
+    let shown = json["disk_path"].as_str().unwrap().to_string();
+    assert!(
+        shown.ends_with("work/out/cache") && Path::new(&shown).is_absolute(),
+        "a relative path starts in the directory of the job: {shown}"
+    );
+    assert!(h.status_json(&plain)["disk"].is_null());
+    assert!(h.status_json(&plain)["disk_path"].is_null());
+    let default_json = h.status_json(&default_path);
+    assert!(
+        default_json["disk_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/work"),
+        "{default_json}"
+    );
+
+    let text = h.ok(&["status", &claimed]);
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("disk:"))
+        .unwrap_or_else(|| panic!("`qex status` must have a disk line:\n{text}"));
+    assert!(line.contains("3MB") && line.contains("out/cache"), "{line}");
+    assert!(
+        !h.ok(&["status", &plain])
+            .lines()
+            .any(|l| l.starts_with("disk:")),
+        "a job with no claim has no disk line"
+    );
+}
+
+/// CLAIM D5: a claim that no free space can ever satisfy is an error at the
+/// submission. No job exists afterwards.
+#[test]
+fn a_claim_larger_than_the_filesystem_is_refused_at_the_submission() {
+    let h = disk_harness("diskbig", "0", "0");
+    let (_, _, total) = disk_of(&h.root);
+    let too_big = bytes_arg(total.saturating_mul(4).max(1 << 40));
+    let out = h.qex(&["submit", "--disk", &too_big, "--", "true"]);
+    assert!(!out.status.success(), "the submission must fail");
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        said.contains("can never start") && said.contains("--disk"),
+        "the message says what happened and what to do: {said}"
+    );
+    assert!(h.list_json().is_empty(), "a refused job leaves no record");
+}
+
+/// CLAIM D3 and D7: a job whose claim does not fit waits with the reason of
+/// the disk, and it starts when the jobs that hold the space stop.
+#[test]
+fn a_claim_waits_for_the_jobs_that_hold_the_space_and_then_starts() {
+    let h = disk_harness("disksib", "0", "0");
+    let (_, free, _) = disk_of(&h.root);
+    let claim = bytes_arg(free / 10 * 6);
+
+    let first = h.submit(&["submit", "--disk", &claim, "--", "sleep", "60"]);
+    h.until("the first job starts", Duration::from_secs(45), || {
+        h.has_started(&first)
+    });
+    let second = h.submit(&["submit", "--disk", &claim, "--", "true"]);
+    h.until(
+        "the second job says why it waits",
+        Duration::from_secs(30),
+        || !h.status_json(&second)["blocked_reason"].is_null(),
+    );
+    let reason = h.status_json(&second)["blocked_reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(reason.contains("waits for disk"), "{reason}");
+    assert!(
+        reason.contains("release the disk space when they stop"),
+        "the jobs of this queue hold it, so the wait has a known end: {reason}"
+    );
+    assert_eq!(h.state_of(&second), "queued");
+    // `qex list` shows the same reason in its note.
+    let listed = h.ok(&["list"]);
+    assert!(
+        listed.contains("disk"),
+        "qex list must show the disk wait:\n{listed}"
+    );
+
+    h.stop(&first);
+    h.until(
+        "the second job starts and ends",
+        Duration::from_secs(45),
+        || h.state_of(&second) == "completed",
+    );
+}
+
+/// CLAIM D4: `reserve_disk` is kept free after a claim. A claim that fits only
+/// without the reserve waits, and the wait has no known end because no job of
+/// this queue holds the space.
+#[test]
+fn reserve_disk_is_kept_free_and_a_job_without_a_claim_ignores_it() {
+    let h0 = disk_harness("diskresv0", "0", "0");
+    let (_, free, _) = disk_of(&h0.root);
+    drop(h0);
+    let h = disk_harness("diskresv", &bytes_arg(free / 2), "0");
+
+    let big = h.submit(&["submit", "--disk", &bytes_arg(free / 10 * 6), "--", "true"]);
+    h.until("the job says why it waits", Duration::from_secs(30), || {
+        !h.status_json(&big)["blocked_reason"].is_null()
+    });
+    let reason = h.status_json(&big)["blocked_reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(reason.contains("reserve_disk"), "{reason}");
+    assert!(reason.contains("no known end"), "{reason}");
+
+    // A job with no claim is not held by the reserve.
+    let plain = h.submit(&["submit", "--", "true"]);
+    h.until(
+        "the job without a claim runs",
+        Duration::from_secs(45),
+        || h.state_of(&plain) == "completed",
+    );
+    // A job with a claim that fits starts.
+    let small = h.submit(&["submit", "--disk", &bytes_arg(free / 10 * 3), "--", "true"]);
+    h.until("the small claim runs", Duration::from_secs(45), || {
+        h.state_of(&small) == "completed"
+    });
+    h.qex(&["cancel", &big]);
+}
+
+/// CLAIM D8 and D6: the floor holds a job with no claim, and a claim of 0
+/// passes it.
+#[test]
+fn the_floor_holds_every_job_but_a_claim_of_zero() {
+    let h0 = disk_harness("diskfloor0", "0", "0");
+    let (_, free, _) = disk_of(&h0.root);
+    drop(h0);
+    // A floor above the free space: the floor holds at once.
+    let h = disk_harness("diskfloor", "0", &bytes_arg(free + (1 << 30)));
+
+    let held = h.submit(&["submit", "--", "true"]);
+    h.until("the job says why it waits", Duration::from_secs(30), || {
+        !h.status_json(&held)["blocked_reason"].is_null()
+    });
+    let reason = h.status_json(&held)["blocked_reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(reason.contains("min_free_disk"), "{reason}");
+    assert!(
+        reason.contains("--disk 0"),
+        "the way out is named: {reason}"
+    );
+
+    let exempt = h.submit(&["submit", "--disk", "0", "--", "true"]);
+    h.until(
+        "the job with --disk 0 runs",
+        Duration::from_secs(45),
+        || h.state_of(&exempt) == "completed",
+    );
+    assert_eq!(
+        h.state_of(&held),
+        "queued",
+        "the floor still holds the other"
+    );
+    h.qex(&["cancel", &held]);
+}
+
+/// CLAIM D2: two filesystems are separate. The claim on one does not hold a
+/// job on the other.
+#[test]
+fn two_filesystems_do_not_hold_each_other() {
+    let shm = Path::new("/dev/shm");
+    let h = disk_harness("disktwo", "0", "0");
+    if !shm.is_dir() || disk_of(shm).0 == disk_of(&h.root).0 {
+        // The two directories must be two filesystems. The suite on Boat
+        // (`docs/disk.md`, "Checked on real mounts") covers this on a loop
+        // mount, and the unit tests of `disk` cover the arithmetic.
+        eprintln!("skipped: /dev/shm and the test directory are one filesystem");
+        return;
+    }
+    let (_, free_a, _) = disk_of(&h.root);
+    let (_, free_b, _) = disk_of(shm);
+    let a = bytes_arg(free_a / 10 * 6);
+    let b = bytes_arg(free_b / 10 * 6);
+
+    let first = h.submit(&["submit", "--disk", &a, "--", "sleep", "60"]);
+    h.until("the first job starts", Duration::from_secs(45), || {
+        h.has_started(&first)
+    });
+    // The same size on the OTHER filesystem starts at once.
+    let other = h.submit(&[
+        "submit",
+        "--disk",
+        &b,
+        "--disk-path",
+        "/dev/shm",
+        "--",
+        "sleep",
+        "60",
+    ]);
+    h.until(
+        "the job on the other filesystem starts",
+        Duration::from_secs(45),
+        || h.has_started(&other),
+    );
+    // A second claim on the FIRST filesystem waits.
+    let same = h.submit(&["submit", "--disk", &a, "--", "true"]);
+    h.until(
+        "the same filesystem says why it waits",
+        Duration::from_secs(30),
+        || !h.status_json(&same)["blocked_reason"].is_null(),
+    );
+    h.stop(&first);
+    h.stop(&other);
+    h.qex(&["cancel", &same]);
+}
+
+/// CLAIM D12: `qex info` shows the free space of the filesystem that a claim
+/// holds, and the claims on it. The JSON form has the same numbers.
+#[test]
+fn info_shows_the_disk_of_a_claim() {
+    let h = disk_harness("diskinfo", "0", "0");
+    let (_, free, _) = disk_of(&h.root);
+    let claim = free / 10 * 3;
+    let id = h.submit(&["submit", "--disk", &bytes_arg(claim), "--", "sleep", "60"]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&id)
+    });
+
+    let json: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+    let disks = json["disks"].as_array().expect("info --json has `disks`");
+    let mine = disks
+        .iter()
+        .find(|d| d["claimed"].as_u64() == Some(claim))
+        .unwrap_or_else(|| panic!("a filesystem with the claim: {disks:?}"));
+    assert_eq!(mine["holders"], 1);
+    assert!(mine["free"].as_u64().unwrap() > 0 && mine["total"].as_u64().unwrap() > 0);
+    assert_eq!(mine["reserve"], 0);
+
+    let text = h.ok(&["info"]);
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("disk"))
+        .unwrap_or_else(|| panic!("`qex info` must have a disk line:\n{text}"));
+    assert!(
+        line.contains("free of") && line.contains("claimed"),
+        "{line}"
+    );
+    h.stop(&id);
+}
+
+/// CLAIM D12: even with no claim, `qex info` shows the disk that holds the
+/// records, because that is the first filesystem to fill.
+#[test]
+fn info_shows_the_disk_of_the_records_when_nothing_claims() {
+    let h = disk_harness("diskinfo0", "0", "0");
+    let json: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+    let disks = json["disks"].as_array().expect("info --json has `disks`");
+    assert!(!disks.is_empty(), "the disk of the records is always there");
+    assert_eq!(disks[0]["claimed"], 0);
+}
+
+/// CLAIM D9: a pipeline stage takes the claim.
+#[test]
+fn a_pipeline_stage_takes_a_disk_claim() {
+    let h = disk_harness("diskpipe", "0", "0");
+    let file = h.root.join("pl.toml");
+    std::fs::write(
+        &file,
+        "[[jobs]]\nname = \"one\"\ncommand = [\"true\"]\n\
+         [jobs.resources]\ndisk = \"2MB\"\ndisk_path = \"/\"\n",
+    )
+    .unwrap();
+    let group = h.ok(&["pipeline", file.to_str().unwrap()]);
+    h.qex(&["wait", &group, "--timeout", "45s"]);
+    let rows = h.list_json();
+    let job = rows.iter().find(|r| r["name"] == "one").expect("the stage");
+    let id = job["id"].as_str().unwrap().to_string();
+    let json = h.status_json(&id);
+    assert_eq!(json["disk"], 2u64 << 20);
+    assert_eq!(json["disk_path"], "/");
+}
+
+/// CLAIM D1: the usage errors say what to do.
+#[test]
+fn the_disk_options_refuse_what_they_cannot_obey() {
+    let h = disk_harness("diskerr", "0", "0");
+    let out = h.qex(&["submit", "--disk-path", "/var/tmp", "--", "true"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--disk-path needs --disk"));
+
+    let out = h.qex(&["submit", "--disk", "half", "--", "true"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no budget"));
+}
+
+/// CLAIM D11: a coordinator of this build reads a job record that qex 0.33.0
+/// wrote, with no disk field, and runs the job.
+#[test]
+fn a_record_without_disk_fields_still_runs() {
+    let h = disk_harness("diskold", "0", "0");
+    let id = h.submit(&["submit", "--", "sleep", "30"]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&id)
+    });
+    h.stop(&id);
+    // Remove the two fields from both files, as 0.33.0 wrote them.
+    for file in ["status.json", "spec.json"] {
+        let path = h.root.join("state/qex/jobs").join(&id).join(file);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("disk");
+        object.remove("disk_path");
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+    }
+    let json = h.status_json(&id);
+    assert!(json["disk"].is_null());
+    let again = h.submit(&["submit", "--", "true"]);
+    h.until(
+        "a new job runs beside the old record",
+        Duration::from_secs(45),
+        || h.state_of(&again) == "completed",
+    );
+}
+
+/// CLAIM D10 and the page for agents: `qex help agents` names the option, and a
+/// topic of its own explains it.
+#[test]
+fn the_help_pages_name_the_disk_claim() {
+    let h = disk_harness("diskhelp", "0", "0");
+    let agents = h.ok(&["help", "agents"]);
+    assert!(
+        agents.contains("--disk"),
+        "`qex help agents` must name --disk"
+    );
+    assert!(
+        agents.contains("not a limit") || agents.contains("promise"),
+        "and say that it is a promise"
+    );
+    let topic = h.ok(&["help", "disk"]);
+    for word in [
+        "--disk-path",
+        "reserve_disk",
+        "min_free_disk",
+        "--disk 0",
+        "st_dev",
+    ] {
+        assert!(
+            topic.contains(word),
+            "`qex help disk` must name {word}:\n{topic}"
+        );
+    }
+    let submit = h.ok(&["submit", "--help"]);
+    assert!(submit.contains("--disk") && submit.contains("--disk-path"));
+}

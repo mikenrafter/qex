@@ -92,6 +92,16 @@ pub const JOB: &str = r##"{
           "description": "The memory. Give a size, or a word: \"half\" and \"guess\" give one half of the budget, and \"full\" and \"max\" give the full budget. One unit step is 1024. The default is the machine memory divided by the core count.",
           "examples": ["8GB", "512MB", "guess", "full"]
         },
+        "disk": {
+          "type": "string",
+          "description": "The disk space that the job claims, as a size such as \"3GB\", or \"0\". The claim is a promise and not a limit: qex stops no job that writes more. qex starts the job when the free space of the filesystem, less [system] reserve_disk and the claims of the jobs that operate, is at least this size. \"0\" claims nothing and exempts the job from [system] min_free_disk. The words \"half\" and \"full\" are not accepted, because the disk has no budget.",
+          "examples": ["3GB", "512MB", "0"]
+        },
+        "disk_path": {
+          "type": "string",
+          "description": "The path whose filesystem holds the disk claim. A relative path starts in the directory of the job. The default is that directory. The path may not exist yet. This field needs disk.",
+          "examples": ["/var/tmp", "target"]
+        },
         "gpu": {
           "type": "integer",
           "minimum": 1,
@@ -250,6 +260,8 @@ pub const PIPELINE: &str = r##"{
                 ]
               },
               "mem": { "type": "string" },
+              "disk": { "type": "string" },
+              "disk_path": { "type": "string" },
               "gpu": { "type": "integer", "minimum": 1 },
               "vram": { "type": "string" },
               "claims": {
@@ -339,6 +351,8 @@ pub const STATUS: &str = r##"{
     "finished_at": { "type": ["integer", "null"], "description": "The stop time, in seconds after the Unix epoch." },
     "cpu": { "type": "integer", "description": "The number of cores that the job claimed." },
     "mem": { "type": "integer", "description": "The memory in bytes that the job claims." },
+    "disk": { "type": ["integer", "null"], "description": "The disk space in bytes that the job claims, or null when it claims none. 0 means that the job claimed nothing on purpose. The claim is a promise and not a limit." },
+    "disk_path": { "type": ["string", "null"], "description": "The absolute path whose filesystem holds the disk claim. Null when disk is null." },
     "claim_source": {
       "type": "string",
       "enum": ["explicit", "learned", "default", "fan-out"],
